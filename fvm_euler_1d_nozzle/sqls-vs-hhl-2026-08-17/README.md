@@ -25,17 +25,33 @@ case and the same qiskit-2.5.2 stack. Only the linear solver differs.
 | metric | SQLS (full_svd) | HHL |
 |---|---|---|
 | circuit qubits | 4 | 14 |
-| CX / gates | ~201 CX ({u3,cx}) | 641,145 gates (Aer basis) |
+| CX / gates | ~201 CX ({u3,cx}, CX only) | 641,145 gates (Aer basis, all gates) |
 | circuit depth | ~398 ({u3,cx}) | 596,688 (Aer basis) |
 | mean time / solve | 0.082 s | 51.70 s |
 | total solver elapsed | 0.62 s | 859.34 s |
-| Newton iters to converge | 6 | 14 |
-| final residual (‖Ax-b‖) | 1.26e-9 | 6.80e-3 |
+| Newton iters | 6 (converged) | 15 (cap reached, not converged; residual ratio 5.5e-4 vs tol 1e-10) |
+| final CFD `residual_total` | 1.26e-9 | 6.80e-3 |
+| final linear-system residual ‖A dq - b‖ (last step) | 1.228e-9 | 3.725e-3 |
 | pre-tail fidelity | 0.99995–0.99998 | 0.988–0.999 |
 
 SQLS is SVD-based, so it acts on the general non-Hermitian Euler Jacobian
 directly — no Hermitian doubling (half the qubits of HHL), no spectral
 pre-scale. Magnitude comes back exact from the classically-known `||final_b||`.
+
+Corrections (2026-10-15, work-plan item 11, from the archived CSVs): the
+HHL run did NOT converge in 14 iterations; it stopped at index 14 because
+`-iters 15` was exhausted, with a residual ratio of 5.5e-4 against the
+1e-10 tolerance. The row formerly labelled "final residual (‖Ax-b‖)" quoted
+the CFD `residual_total` (1.2604e-9 / 6.7953e-3); the linear-system
+residuals ‖A dq - b‖ at the last step are 1.228e-9 (SQLS) and 3.725e-3
+(HHL). The gate counts are in different bases (see caveat 1): the SQLS
+figure is a CX-only count in {u3,cx}, the HHL figure counts ALL gates in
+Aer's own basis; they are not comparable until the fixed-basis `fb_*`
+columns (both circuits transpiled to {u3,cx} at optimization_level 0,
+`fvm_euler_1d_solver` item 11) are used. At this build those give SQLS
+nelem 5: 200-201 CX / depth 400-401 / 572-577 gates; HHL nelem 5: 2,054,602
+CX / depth 4,067,708 / 5,455,676 gates (one statevector solve of the same
+step-0 system).
 
 ## Caveats (load-bearing — read before citing the numbers)
 
@@ -61,11 +77,16 @@ pre-scale. Magnitude comes back exact from the classically-known `||final_b||`.
    match. At 150k shots on a 16-state system, pre-tail fidelity was identical
    at repeats 1 vs 10 (~0.99997) — sampling already saturated.
 
-4. **Fidelity tail collapse.** SQLS per-iter fidelity is ~1.0 through the
-   penultimate Newton step, then collapses (0.45–0.69, run-dependent) at the
-   converged final step — a shots-sampling artifact on a near-zero solution
-   update (dQ ~ 1e-11), NOT a solver error (final residual ~1e-9). Statevector
-   mode (`-shots 0`) removes it.
+4. **Fidelity tail collapse (root cause found, fixed).** SQLS per-iter
+   fidelity was ~1.0 through the penultimate Newton step, then collapsed
+   (0.45–0.69, run-dependent) at the converged final step. The cause is the
+   padding, not shot noise as such: `convert_to_pow2` padded the RHS with a
+   constant 1e-8, so once ‖dQ‖ fell below ~1e-8 the padded 16th amplitude
+   soaked up nearly all of the measurement probability (about 8 of the
+   150,000 shots landed on the 15 true entries at the last step). Work-plan
+   item 9 pads with exact zeros now; with that fix the last-step fidelity is
+   0.99996 to 0.99999 on the same case (item 9 build: 0.99997; item 11 run
+   2026-10-15: 0.99996). Statevector mode (`-shots 0`) was never affected.
 
 ## Contents
 

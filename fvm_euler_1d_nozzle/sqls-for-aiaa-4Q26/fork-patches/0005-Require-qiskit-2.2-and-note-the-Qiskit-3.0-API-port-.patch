@@ -1,0 +1,67 @@
+From 9d1d7bbb083785a52baea9605d6b2d01e50d5cdc Mon Sep 17 00:00:00 2001
+From: Andy Gallo <agallojr@518computing.com>
+Date: Thu, 15 Oct 2026 20:30:21 -0400
+Subject: [PATCH 5/5] Require qiskit 2.2 and note the Qiskit 3.0 API port in
+ README and setup.py
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ README.md      | 11 +++++++++--
+ pyproject.toml |  2 +-
+ setup.py       |  2 +-
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/README.md b/README.md
+index cd6d944..c7dcaff 100644
+--- a/README.md
++++ b/README.md
+@@ -7,11 +7,18 @@ git clone https://github.com/jw676/quantum_linear_solvers.git
+ cd quantum_linear_solvers
+ pip install .
+ 
+-Or use this fork updated to Qiskit 1.4.x: https://github.com/agallojr/quantum_linear_solvers
++Or use this fork, ported to Qiskit >= 2.2: https://github.com/Q8020-CFD/quantum_linear_solvers
+ ```
+ 
++This fork (Q8020-CFD/quantum_linear_solvers) requires Qiskit >= 2.2 and uses
++only APIs that survive Qiskit 3.0: `phase_estimation()`, `ExactReciprocalGate`,
++`PiecewiseChebyshevGate`, and a plain `QuantumCircuit` base for the matrix
++classes (no `PhaseEstimation`, `ExactReciprocal`, `PiecewiseChebyshev`, `QFT`
++or `BlueprintCircuit`). The phase-estimation step is isolated in
++`HHL.qpe_circuit()` so another QPE implementation can be substituted.
++
+ ## Documentation
+-This tutorial is based on an older version of this package, which used an older version of Qiskit. The current version of this library uses Qiskit 1.4.x, so these examples won't work as-is. But the gist of the approach remains the same, only the syntax changes.
++This tutorial is based on an older version of this package, which used an older version of Qiskit. The current version of this library requires Qiskit >= 2.2, so these examples won't work as-is. But the gist of the approach remains the same, only the syntax changes.
+ 
+ Tutorial: https://qiskit.org/textbook/ch-applications/hhl_tutorial.html
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index aecf91b..30f6f96 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,7 +5,7 @@ description = "Add your description here"
+ readme = "README.md"
+ requires-python = "~=3.12"
+ dependencies = [
+-    "qiskit>=2.0",
++    "qiskit>=2.2",
+     "numpy",
+     "scipy",
+     "ddt",
+diff --git a/setup.py b/setup.py
+index 912027c..4abc7b3 100644
+--- a/setup.py
++++ b/setup.py
+@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
+ import os
+ 
+ name = "quantum_linear_solvers"
+-version = "0.1.0"    # pinned to Qiskit 1.x
++version = "0.1.0"    # requires Qiskit >= 2.2
+ description = (
+     "Quantum linear solvers package"
+ )
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,188 @@
+# fvm_sqls_aiaa_sweeps.DRAFT.toml
+#
+# DRAFT -- NOT TO BE RUN WITHOUT ANDY'S EXPLICIT APPROVAL.
+# Written 2026-10-15T01:51Z as item 5 of sqls-for-aiaa-4Q26/WORKPLAN.md.
+# Modeled on ../fvm_cfl_sweeps.toml (the April 2026 Frontier CFL sweep),
+# updated for the SQLS linear solver (fvm main @ ef7f0a8b) and for the
+# harvester's CURRENT location under aux/ (the April TOML still points at
+# codes/, which no longer exists -- that is why the 2026-04-08 and
+# 2026-04-10 postproc steps failed with exit code 2).
+#
+# Exact solver flag spellings come from
+#   grep -n add_argument /Users/agallojr/proj/src/q8020/fvm_euler_1d_solver/nozzle_1d_solver.py
+#
+# Sweeper: q8020-sweep from q8020-cfd-metautil, installed (editable) in
+#   /Users/agallojr/proj/src/q8020/q8020-cfd-metautil/.venv/bin/q8020-sweep
+# It is NOT on PATH. Groups whose name starts with "_" are skipped unless
+# named explicitly on the command line (sweep.py run_sweep), so the smoke
+# group must be named: `q8020-sweep <toml> _smoke`.
+#
+# ---------------------------------------------------------------------------
+# Laptop, smoke only (the ONLY thing to run first; ~5 s):
+#   /Users/agallojr/proj/src/q8020/q8020-cfd-metautil/.venv/bin/q8020-sweep \
+#     fvm_sqls_aiaa_sweeps.DRAFT.toml _smoke --dry-run
+#   /Users/agallojr/proj/src/q8020/q8020-cfd-metautil/.venv/bin/q8020-sweep \
+#     fvm_sqls_aiaa_sweeps.DRAFT.toml _smoke
+#
+# Frontier, SQLS groups (parallel SLURM, one sbatch for all cases):
+#   q8020-sweep fvm_sqls_aiaa_sweeps.DRAFT.toml sqls_shots sqls_cfl sqls_nelem \
+#     --set _slurm=true --set _run_mode=parallel \
+#     --set _output_dir=/lustre/orion/ard189/proj-shared/agallojr/q8020 \
+#     --set _solver_dir=<frontier>/fvm_euler_1d_solver \
+#     --set _metautil_dir=<frontier>/q8020-cfd-metautil \
+#     --set _experiment_dir=<frontier>/q8020-cfd-experiments \
+#     --set _postproc_venv=<frontier>/q8020-cfd-metautil/.venv
+#   (<frontier> = /autofs/nccs-svm1_proj/ard189/agallojr/proj/src/q8020 in
+#    April 2026; verify with `pwd -P` before submitting.)
+#
+# Frontier, HHL control, as a SEPARATE submission (its cases take ~20-40 min
+# each on a Frontier node, the SQLS cases take seconds; one allocation holds
+# all its nodes until the slowest srun step finishes):
+#   q8020-sweep fvm_sqls_aiaa_sweeps.DRAFT.toml hhl_matched \
+#     --set _slurm=true --set _run_mode=parallel --set _slurm_walltime=02:00:00 \
+#     --set _output_dir=... (same path overrides as above)
+# ---------------------------------------------------------------------------
+
+[global]
+# Output root. Laptop default; Frontier overrides with --set _output_dir=...
+# The sweeper creates <_output_dir>/<local yyyy-mm-dd>/_<8hex>/<group>_<i>/trial_<n>_<8hex>/
+_output_dir = "~/q8020"
+
+# --- Paths (laptop absolute defaults; override every one with --set on
+#     Frontier). Keep these as LITERALS: template expansion is single-pass
+#     (sweep.py _expand_templates), so a value such as "${_metautil_dir}/.venv"
+#     would reach the global _script one level unresolved.
+_solver_dir = "/Users/agallojr/proj/src/q8020/fvm_euler_1d_solver"
+_metautil_dir = "/Users/agallojr/proj/src/q8020/q8020-cfd-metautil"
+_experiment_dir = "/Users/agallojr/proj/src/q8020/q8020-cfd-experiments"
+_postproc_venv = "/Users/agallojr/proj/src/q8020/q8020-cfd-metautil/.venv"
+
+# --- Execution mode. Sequential is the laptop-safe default (and a sequential
+#     --dry-run writes nothing to disk). Frontier: --set _run_mode=parallel
+#     --set _slurm=true. NOTE a parallel-mode --dry-run DOES create the case
+#     directories and pipeline_args.json under _output_dir (verified in
+#     05-sweep-mechanism.md section 2d).
+_slurm = false
+_run_mode = "sequential"
+_slurm_project = "ard189"
+_slurm_partition = "batch"
+_slurm_walltime = "02:00:00"
+_slurm_exclusive_node = true  # one node per case, as in April. For the
+                              # seconds-long SQLS cases consider
+                              # --set _slurm_exclusive_node=false (packed
+                              # mode, 64 cores/node) -- open question 7.
+_slurm_pack_venvs = ["${_solver_dir}/.venv", "${_postproc_venv}"]  # NVMe sbcast
+
+# --- Solver command (fvm venv must contain qiskit 2.5.2 stack, linear_solvers
+#     from Q8020-CFD/quantum_linear_solvers, and sqls as an editable install).
+_script = """\
+source ${_solver_dir}/.venv/bin/activate && \
+python3 ${_solver_dir}/nozzle_1d_solver.py\
+"""
+
+# --- Per-case postproc: the fvm harvester at its CURRENT path. It imports
+#     q8020_cfd_metautil.meta_fragment, so it runs in the metautil venv.
+#     Writes q8020_{case,code,backend,artifacts,results,analysis}_<id>_0.json.
+_case_postproc = """\
+source ${_postproc_venv}/bin/activate && \
+python3 ${_experiment_dir}/aux/fvm_euler_1d_nozzle/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py\
+"""
+_inject_outdir = "-outdir"
+
+# --- Solver parameters common to every group (paper protocol) ---
+"-time_scheme" = "BDF1"
+"-localdt" = true
+"-noshow" = true
+"-linsolver" = "SQLS"            # hhl_matched overrides to HHL
+"-sqls_method" = "full_svd"      # exact SVD assembly; truncated_{qr,mps} later (qtsuite #54)
+"-sqls_repeats" = 1              # 1 = same 150k-shot budget as a single HHL run
+"-sqls_state_prep" = "initialize"
+# -sqls_k is ignored by full_svd (default 128); not set.
+# -v 2 is REQUIRED for SQLS circuit metrics: cx_count/circuit_depth in
+# qc_metadata_sqls_*.csv are only computed when verbosity == 2
+# (quantum_tools.py:829, sqls/runtime/quantum.py count_cx_depth); otherwise
+# they are written as -1. It costs one extra {u3,cx} transpile per Newton
+# step. Do NOT apply -v 2 to HHL (verbosity 2 also enables circuit drawing
+# of ~600k-gate circuits); hhl_matched resets it to 1.
+"-v" = 2
+
+# ===========================================================================
+# Groups. Case count = product of list lengths x _trials.
+# Cost notes use the 2026-08-17 laptop numbers (MH-DT9TLJQR2V):
+#   SQLS full_svd nelem 5, 150k shots: 0.62 s solver elapsed for a run that
+#   converged in 6 Newton iters (per-solve 0.075-0.103 s, 4 qubits, ~200 CX);
+#   HHL nelem 5, 150k shots, 15 iters: 859 s laptop / ~1125-1653 s Frontier.
+#   Sweeper overhead per case (April, Frontier): ~0.9 s pre + ~0.5 s post +
+#   ~0.4 s harvester.
+# ===========================================================================
+
+# --- Smoke: the only group to run first. ~1-2 s solver, exact statevector.
+#     Must be named explicitly (leading underscore): `q8020-sweep ... _smoke`.
+[_smoke]
+"-nelem" = 2
+"-iters" = 2
+"-initers" = 1
+"-cfl" = 1e10
+"-shots" = 0
+
+# --- Shot sweep at nelem 5, CFL 1e10 (steady Newton), 15 outer / 1 inner.
+#     7 shot values x 10 trials = 70 cases. shots 0 = exact statevector
+#     (the shots-0 trials are deterministic; 10 copies are cheap, ~3 s each,
+#     and keep the directory shape uniform). Laptop sequential: ~4 min total.
+[sqls_shots]
+"-nelem" = 5
+"-cfl" = 1e10
+"-iters" = 15
+"-initers" = 1
+"-shots" = [0, 1000, 5000, 10000, 50000, 100000, 150000]
+"_trials" = 10
+
+# --- CFL sweep at 150k shots (matches April time_steps group for HHL).
+#     5 CFL x 10 trials = 50 cases. CFL 1 runs the full 15 iters (~1.5-2 s
+#     solver each); CFL 1e10 duplicates the sqls_shots 150k cell (open
+#     question 10). Laptop sequential: ~3-4 min total.
+[sqls_cfl]
+"-nelem" = 5
+"-cfl" = [1, 5, 10, 25, 1e10]
+"-iters" = 15
+"-initers" = 1
+"-shots" = 150000
+"_trials" = 10
+
+# --- Mesh scaling at 150k shots. nelem -> system 3*nelem -> SQLS padded N
+#     (no Hermitian doubling): 5->15->16 (4 qubits), 11->33->64 (6),
+#     21->63->64 (6), 42->126->128 (7), 85->255->256 (8). HHL would be 2N:
+#     32, 128, 128, 256, 512.
+#     _trials = 3, not 10: the quantities this group exists to measure
+#     (qubits, cx_count, depth, solve_time, exact-statevector accuracy) are
+#     deterministic in N; the shot-noise spread at fixed 150k shots is a
+#     secondary effect and 3 trials bound it. Raise to 10 if the paper's
+#     mesh-scaling plot needs shot-noise error bars (open question 1).
+#     nelem 85: dense SVD of 256x256 is ~10 ms; the cost is UnitaryGate
+#     synthesis on 8 qubits (QSD ~ (23/48)*4^8 ~ 31k CX per unitary, two of
+#     them) plus the -v 2 {u3,cx} transpile: estimate 10-60 s per Newton step,
+#     5-15 min per case. Feasible on a laptop core; trivial on a node.
+#     5 nelem x 3 trials = 15 cases; laptop sequential ~0.5-1 h, dominated by
+#     the three nelem-85 cases.
+[sqls_nelem]
+"-nelem" = [5, 11, 21, 42, 85]
+"-cfl" = 1e10
+"-iters" = 15
+"-initers" = 1
+"-shots" = 150000
+"_trials" = 3
+
+# --- HHL control at the matched settings, same stack (qiskit 2.5.2), so the
+#     SQLS-vs-HHL comparison is same-code, same-machine. 10 cases.
+#     ~860 s each on the laptop (2.4 h sequential -- NOT for the laptop);
+#     ~20-40 min each on a Frontier node, all 10 in parallel. Submit as its
+#     own job (see header). -v 1: do not enable HHL circuit drawing.
+[hhl_matched]
+"-linsolver" = "HHL"
+"-v" = 1
+"-nelem" = 5
+"-cfl" = 1e10
+"-iters" = 15
+"-initers" = 1
+"-shots" = 150000
+"_trials" = 10

@@ -6,7 +6,8 @@ via metautil, and writes a q8020_backend_* fragment that overwrites
 the thin one produced by the FVM harvester.
 
 Usage (as _case_postproc):
-    python q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/backend_meta_harvester.py <postproc_json>
+    python q8020-cfd-experiments/aux/fvm_euler_1d_nozzle/fvm_euler_1d_nozzle/\\
+backend_meta_harvester.py <postproc_json>
 """
 
 import json

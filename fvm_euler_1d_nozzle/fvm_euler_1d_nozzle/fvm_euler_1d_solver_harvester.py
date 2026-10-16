@@ -13,6 +13,7 @@ import csv
 import json
 import pickle
 import re
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,10 @@ from q8020_cfd_metautil.meta_fragment import (
     write_code,
     write_results,
 )
+
+# Gate basis the circuit metrics are counted in; never compare across bases.
+HHL_BASIS = "aer_simulator"  # transpile(circ, AerSimulator), all gates
+SQLS_BASIS = "{u3,cx}"       # sqls count_cx_depth; CX count in after.cx_count
 
 
 def _parse_csv_to_dicts(csv_path: Path) -> list[dict[str, Any]]:
@@ -54,6 +59,12 @@ def _parse_csv_to_floats(csv_path: Path) -> list[dict[str, float]]:
     return result
 
 
+def _iter_no(path: Path) -> int:
+    """Iteration number N from an ``...iter<N>...`` filename; -1 if absent."""
+    m = re.search(r"iter(\d+)", path.name)
+    return int(m.group(1)) if m else -1
+
+
 def _load_pickle(pkl_path: Path) -> dict[str, Any] | None:
     """Load a pickle file, returning None if not found."""
     if not pkl_path.exists():
@@ -74,6 +85,7 @@ def _inventory_files(outdir: Path) -> dict[str, list[dict[str, Any]]]:
         "pkl": [],
         "png": [],
         "other": [],
+        "rotated_csv": [],
     }
 
     for file_path in outdir.iterdir():
@@ -108,6 +120,20 @@ def _inventory_files(outdir: Path) -> dict[str, list[dict[str, Any]]]:
             inventory["png"].append(info)
         else:
             inventory["other"].append(info)
+
+    # Stale-header CSVs the solver rotated into rotated/ (fvm e50f4800):
+    # listed only, never parsed (the metric globs are non-recursive).
+    rotated = outdir / "rotated"
+    if rotated.is_dir():
+        for file_path in sorted(rotated.glob("*.csv")):
+            stat = file_path.stat()
+            inventory["rotated_csv"].append({
+                "name": f"rotated/{file_path.name}",
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+            })
 
     return inventory
 
@@ -182,58 +208,246 @@ def _read_stdout(outdir: Path) -> str:
     return ""
 
 
-def _parse_stdout_lu_solutions(outdir: Path) -> list[dict[str, list[float]]]:
-    """Parse LU and HHL solution vectors from stdout comparison tables.
+# Stdout comparison-table layouts: solver -> (header token, quantum column)
+_STDOUT_SOL_LAYOUTS: dict[str, tuple[str, int]] = {
+    "HHL": ("HHL sol", 2),    # LU sol, Herm LU sol, HHL sol, L1_diff(%)
+    "SQLS": ("SQLS sol", 1),  # LU sol, SQLS sol, L1_diff(%)
+}
 
-    Each iteration prints a block like:
+
+def _parse_stdout_lu_solutions(text: str) -> list[dict[str, Any]]:
+    """Parse LU and quantum solution vectors from stdout comparison tables.
+
+    Each iteration prints a block like (HHL, 4 columns):
         LU sol \t    Herm LU sol    HHL sol    L1_diff(%)
-        -7.736e-02  -7.736e-02  -0.000e+00  1.000e+02
-        ...
-        ====...====
+    or (SQLS, 3 columns):
+        LU sol \t    SQLS sol    L1_diff(%)
+    followed by rows of floats and a ====...==== line.
 
     Returns list of dicts (one per iteration), each with:
-        {"lu": [float, ...], "hhl": [float, ...]}
+        {"solver": "HHL"|"SQLS", "lu": [float, ...], "qsol": [float, ...]}
     """
-    text = _read_stdout(outdir)
     if not text:
         return []
 
-    results: list[dict[str, list[float]]] = []
+    results: list[dict[str, Any]] = []
     lines = text.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.strip().startswith("LU sol") and "HHL sol" in line:
+        layout = None
+        if line.strip().startswith("LU sol"):
+            layout = next(
+                ((name, col)
+                 for name, (tok, col) in _STDOUT_SOL_LAYOUTS.items()
+                 if tok in line),
+                None,
+            )
+        if layout is not None:
+            solver, col = layout
             i += 1
             lu_vals: list[float] = []
-            hhl_vals: list[float] = []
+            q_vals: list[float] = []
             while i < len(lines):
                 row = lines[i].strip()
                 if not row or row.startswith("="):
                     break
                 parts = row.split()
-                if len(parts) >= 3:
+                if len(parts) > col:
                     try:
                         lu_vals.append(float(parts[0]))
-                        hhl_vals.append(float(parts[2]))
+                        q_vals.append(float(parts[col]))
                     except ValueError:
                         break
                 i += 1
             if lu_vals:
-                results.append({"lu": lu_vals, "hhl": hhl_vals})
+                results.append(
+                    {"solver": solver, "lu": lu_vals, "qsol": q_vals}
+                )
         i += 1
 
     return results
 
 
-def _parse_stdout_backend(outdir: Path) -> dict[str, Any]:
+def _stdout_declares_converged(text: str) -> bool:
+    """True if the solver's banner follows the LAST ``step:`` line.
+
+    Anchoring to the last step keeps a banner from an earlier chunk of a
+    concatenated/resumed log from counting.
+    """
+    steps = list(re.finditer(r"^\s*step:", text, re.MULTILINE))
+    tail = text[steps[-1].end():] if steps else text
+    return "SOLUTION CONVERGED" in tail
+
+
+def _is_sqls(
+    run_params: dict[str, Any], qc_metadata: list[dict[str, Any]]
+) -> bool:
+    """SQLS run: pickle says so, or the qc_metadata CSV has SQLS columns."""
+    if str(run_params.get("linear_solver", "")).upper() == "SQLS":
+        return True
+    return bool(qc_metadata) and "solve_time" in qc_metadata[0]
+
+
+def _int_or_none(val: Any) -> int | None:
+    """Int of a numeric CSV cell; None if missing or the -1 'not logged' flag."""
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        return None
+    return None if ival < 0 else ival
+
+
+def _sqls_params(
+    run_params: dict[str, Any], qc_metadata: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """SQLS method/k/state_prep/repeats from pickle, falling back to the CSV."""
+    qc = run_params.get("quantum_circuit") or {}
+    first = qc_metadata[0] if qc_metadata else {}
+    out: dict[str, Any] = {}
+    for key in ("method", "k", "state_prep", "repeats"):
+        val = qc.get(key, first.get(key))
+        if key in ("k", "repeats") and val is not None:
+            val = int(val)
+        out[key] = val
+    return out
+
+
+def _float_or_none(val: Any) -> float | None:
+    """Float of a numeric CSV cell; None if missing or non-numeric."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fixed_basis(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Shared fixed-basis counts of one step (fvm cca70256 fb_* columns).
+
+    None when the CSV predates the columns. Under -circ_metrics none the
+    solver writes -1 counts and basis 'none'; those come out null.
+    """
+    if "fb_depth" not in row:
+        return None
+    raw = str(row.get("fb_basis", "")).strip()
+    basis = {"u3cx": SQLS_BASIS, "none": None, "": None}.get(raw, raw)
+    return {
+        "basis": basis,
+        "depth": _int_or_none(row.get("fb_depth")),
+        "total_gates": _int_or_none(row.get("fb_total_gates")),
+        "cx_count": _int_or_none(row.get("fb_cx_count")),
+        "t_count_s": (_float_or_none(row.get("t_count_s"))
+                      if basis is not None else None),
+        "cached": _bool_or_none(row.get("fb_cached")),
+    }
+
+
+def _bool_or_none(val: Any) -> bool | None:
+    """Bool of a CSV cell written from a Python bool; None if absent/empty."""
+    text = str(val).strip().lower() if val is not None else ""
+    return {"true": True, "1": True, "1.0": True,
+            "false": False, "0": False, "0.0": False}.get(text)
+
+
+def _fixed_basis_summary(
+    passes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Medians of the fixed-basis counts over steps; t_count_s over steps
+    >= 1 only (step 0 carries the transpiler warm-up). None if no step has
+    fixed-basis columns."""
+    fbs = [(p["step"], p["fixed_basis"]) for p in passes
+           if p.get("fixed_basis")]
+    if not fbs:
+        return None
+
+    def med(vals: list[Any]) -> float | None:
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
+    bases = sorted({fb["basis"] for _, fb in fbs if fb["basis"]})
+    return {
+        "basis": bases[0] if len(bases) == 1 else (bases or None),
+        "median_depth": med([fb["depth"] for _, fb in fbs]),
+        "median_total_gates": med([fb["total_gates"] for _, fb in fbs]),
+        "median_cx_count": med([fb["cx_count"] for _, fb in fbs]),
+        # cached rows reuse an earlier count (t_count_s 0.0): excluded
+        "median_t_count_s_steps_ge1": med(
+            [fb["t_count_s"] for step, fb in fbs
+             if step >= 1 and not fb.get("cached")]
+        ),
+        "n_steps": len(fbs),
+        "n_cached_steps": sum(1 for _, fb in fbs if fb.get("cached")),
+    }
+
+
+def _deflation(row: dict[str, Any]) -> dict[str, Any] | None:
+    """HHL shifted-SVD deflation record of one step (fvm 8eb40832 columns).
+
+    None when the CSV predates the columns (SQLS, all archived runs).
+    kappa is of the original A, kappa_eff of the shifted A' given to HHL.
+    """
+    if "deflate_k" not in row:
+        return None
+    return {
+        "deflate_k": _int_or_none(row.get("deflate_k")),
+        "kappa": _float_or_none(row.get("kappa")),
+        "kappa_eff": _float_or_none(row.get("kappa_eff")),
+        "n_clock": _int_or_none(row.get("n_clock")),
+        "x_share_classical": _float_or_none(row.get("x_share_classical")),
+        "t_svd_s": _float_or_none(row.get("t_svd_s")),
+    }
+
+
+def _linear_system_deflation(
+    qc_metadata: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """What condition_number describes (A, or A' when deflate_k > 0) and the
+    range of the original-A kappa; null when the columns are absent."""
+    defl = [d for d in map(_deflation, qc_metadata) if d is not None]
+    if not defl:
+        return {"condition_number_refers_to": None,
+                "kappa_original_range": None}
+    shifted = any((d["deflate_k"] or 0) > 0 for d in defl)
+    kappas = [d["kappa"] for d in defl if d["kappa"] is not None]
+    return {
+        "condition_number_refers_to": "A_shifted" if shifted else "A",
+        "kappa_original_range": (
+            [round(min(kappas), 4), round(max(kappas), 4)] if kappas else None
+        ),
+    }
+
+
+def _deflation_summary(
+    passes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Medians over steps of kappa, kappa_eff, x_share_classical and the
+    first/last n_clock, for HHL runs with deflate_k > 0; None otherwise."""
+    defl = [p["deflation"] for p in passes if p.get("deflation")]
+    if not defl or not any((d["deflate_k"] or 0) > 0 for d in defl):
+        return None
+
+    def med(key: str) -> float | None:
+        vals = [d[key] for d in defl if d[key] is not None]
+        return statistics.median(vals) if vals else None
+
+    return {
+        "deflate_k": defl[-1]["deflate_k"],
+        "median_kappa": med("kappa"),
+        "median_kappa_eff": med("kappa_eff"),
+        "median_x_share_classical": med("x_share_classical"),
+        "n_clock_first": defl[0]["n_clock"],
+        "n_clock_last": defl[-1]["n_clock"],
+        "n_steps": len(defl),
+    }
+
+
+def _parse_stdout_backend(text: str) -> dict[str, Any]:
     """Parse stdout for backend and shots info as fallback.
 
     Looks for lines like:
         Backend: aer_simulator_statevector
         Shots: 1024
     """
-    text = _read_stdout(outdir)
     if not text:
         return {}
 
@@ -250,35 +464,35 @@ def _parse_stdout_backend(outdir: Path) -> dict[str, Any]:
     return result
 
 
-def _extract_per_iteration_results(
+def _extract_dq_by_step(
     outdir: Path,
-) -> list[dict[str, Any]]:
-    """Glob per-iteration results and dq CSVs, sorted by iter number."""
-    # results_nelem*_iter*_*.csv
-    result_files = sorted(
-        outdir.glob("results_nelem*_iter*_*.csv"),
-        key=lambda p: int(re.search(r"iter(\d+)", p.name).group(1))  # type: ignore[union-attr]
-    )
-    # dq_nelem*_iter*_*.csv
-    dq_files = sorted(
-        outdir.glob("dq_nelem*_iter*_*.csv"),
-        key=lambda p: int(re.search(r"iter(\d+)", p.name).group(1))  # type: ignore[union-attr]
-    )
-
-    # Build lookup of dq by step
+) -> tuple[dict[int, list[dict[str, float]]], bool]:
+    """Parse dq_nelem*_iter*_*.csv by step; flag unsteady (_nsteps) naming."""
+    dq_files = sorted(outdir.glob("dq_nelem*_iter*_*.csv"), key=_iter_no)
     dq_by_step: dict[int, list[dict[str, float]]] = {}
     for dq_path in dq_files:
-        m = re.search(r"iter(\d+)", dq_path.name)
-        if m:
-            step = int(m.group(1))
+        step = _iter_no(dq_path)
+        if step >= 0:
             dq_by_step[step] = _parse_csv_to_floats(dq_path)
+    unsteady = any("_nsteps" in p.name for p in dq_files)
+    return dq_by_step, unsteady
+
+
+def _extract_per_iteration_results(
+    outdir: Path,
+    dq_by_step: dict[int, list[dict[str, float]]],
+) -> list[dict[str, Any]]:
+    """Glob per-iteration results CSVs, sorted by iter number, with dq."""
+    # results_nelem*_iter*_*.csv
+    result_files = sorted(
+        outdir.glob("results_nelem*_iter*_*.csv"), key=_iter_no
+    )
 
     per_iter: list[dict[str, Any]] = []
     for res_path in result_files:
-        m = re.search(r"iter(\d+)", res_path.name)
-        if not m:
+        step = _iter_no(res_path)
+        if step < 0:
             continue
-        step = int(m.group(1))
         entry: dict[str, Any] = {
             "step": step,
             "solution": _parse_csv_to_floats(res_path),
@@ -297,7 +511,8 @@ def _extract_per_iteration_results(
 def _build_backend(
     run_params: dict[str, Any],
     qc_metadata: list[dict[str, Any]],
-    outdir: Path,
+    stdout_text: str,
+    sqls_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build backend fragment from pickle, qc_metadata CSV, and stdout fallback."""
     # Start with pickle data
@@ -314,7 +529,7 @@ def _build_backend(
 
     # Fallback to stdout if pickle didn't provide backend info
     if not name:
-        stdout_info = _parse_stdout_backend(outdir)
+        stdout_info = _parse_stdout_backend(stdout_text)
         name = stdout_info.get("name", "unknown")
         if not nshots:
             nshots = stdout_info.get("nshots", 0)
@@ -325,12 +540,25 @@ def _build_backend(
     # Determine simulator type
     sim_type = "simulator"
 
-    # num_qubits from first row of qc_metadata CSV
+    # num_qubits: the actual circuit width circ_qubits when logged (fvm
+    # cca70256+); else the legacy rule from the first qc_metadata row:
+    # SQLS n_data_qubits + m_ancilla, HHL nqubits (log2 of the Hermitian
+    # system, not the circuit). -1 "not logged" cells count as missing.
     num_qubits = None
-    if qc_metadata:
-        nq = qc_metadata[0].get("nqubits")
-        if nq is not None:
-            num_qubits = int(nq)
+    num_qubits_source = None
+    sqls = sqls_params is not None
+    first = qc_metadata[0] if qc_metadata else {}
+    if _int_or_none(first.get("circ_qubits")) is not None:
+        num_qubits = _int_or_none(first.get("circ_qubits"))
+        num_qubits_source = "circ_qubits"
+    elif sqls and _int_or_none(first.get("n_data_qubits")) is not None:
+        num_qubits = _int_or_none(first["n_data_qubits"]) + (
+            _int_or_none(first.get("m_ancilla")) or 0
+        )
+        num_qubits_source = "legacy"
+    elif _int_or_none(first.get("nqubits")) is not None:
+        num_qubits = _int_or_none(first.get("nqubits"))
+        num_qubits_source = "legacy"
 
     backend: dict[str, Any] = {
         "name": name,
@@ -341,17 +569,117 @@ def _build_backend(
     }
     if num_qubits is not None:
         backend["num_qubits"] = num_qubits
+        backend["num_qubits_source"] = num_qubits_source
     if nshots:
         backend["nshots"] = int(nshots) if not isinstance(nshots, int) else nshots
+    # Effective shot budget per linear solve: pickle, else CSV column, else
+    # the legacy SQLS rule nshots x repeats; null when unknown. 0 means
+    # statevector (no sampling).
+    effective_shots = _int_or_none(run_params.get("effective_shots"))
+    if effective_shots is None:
+        effective_shots = _int_or_none(first.get("effective_shots"))
+    repeats = sqls_params["repeats"] if sqls_params else None
+    if effective_shots is None and nshots and repeats:
+        effective_shots = int(nshots) * int(repeats)
+    backend["effective_shots"] = effective_shots
+    # Shot-sampler seed: pickle, else CSV column ('' = unseeded); null
+    # when unseeded or not recorded.
+    seed = run_params.get("seed")
+    if seed is None:
+        seed = _int_or_none(first.get("seed"))
+    backend["seed"] = None if seed is None else int(seed)
 
     return backend
+
+
+def _build_artifacts_sqls(
+    qc_metadata: list[dict[str, Any]],
+    file_inventory: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """SQLS artifacts: cx/depth in {u3,cx}, solve_time as execute time.
+
+    SQLS logs no raw circuit and no generate/transpile split, so those are
+    null; there is no Hermitian doubling, so matrix_size_hermitian is null.
+    """
+    transpile_passes: list[dict[str, Any]] = []
+    total_solve = 0.0
+    condition_numbers: list[float] = []
+    for row in qc_metadata:
+        solve_time = float(row.get("solve_time", 0.0))
+        total_solve += solve_time
+        cond = row.get("condition_number")
+        if cond is not None:
+            condition_numbers.append(float(cond))
+        n_data = _int_or_none(row.get("n_data_qubits"))
+        m_anc = _int_or_none(row.get("m_ancilla"))
+        width = n_data + (m_anc or 0) if n_data is not None else None
+        transpile_passes.append({
+            "step": int(row.get("step", 0)),
+            "wall_time_generate_s": None,
+            "wall_time_transpile_s": None,
+            "wall_time_execute_s": round(solve_time, 6),
+            "before": None,
+            "after": {
+                "depth": _int_or_none(row.get("circuit_depth")),
+                "num_qubits": width,
+                "gate_count": None,  # SQLS logs no all-gates count
+                "cx_count": _int_or_none(row.get("cx_count")),
+                "basis": SQLS_BASIS,
+                "gate_count_scope": "none; CX only, in cx_count",
+            },
+            "sqls": {
+                "method": row.get("method"),
+                "k": _int_or_none(row.get("k")),
+                "state_prep": row.get("state_prep"),
+                "repeats": _int_or_none(row.get("repeats")),
+                "n_data_qubits": n_data,
+                "m_ancilla": m_anc,
+                "cx_count": _int_or_none(row.get("cx_count")),
+                "circuit_depth": _int_or_none(row.get("circuit_depth")),
+                "aer_device": row.get("aer_device"),
+                "solve_time": solve_time,
+            },
+            "fixed_basis": _fixed_basis(row),
+            "deflation": _deflation(row),
+        })
+
+    linear_system: dict[str, Any] = {}
+    if qc_metadata:
+        first = qc_metadata[0]
+        linear_system["matrix_size_original"] = int(first.get("matrix_size_orig", 0))
+        linear_system["matrix_size_padded"] = int(first.get("matrix_size_pow2", 0))
+        linear_system["matrix_size_hermitian"] = None
+    if condition_numbers:
+        linear_system["condition_number_range"] = [
+            round(min(condition_numbers), 4),
+            round(max(condition_numbers), 4),
+        ]
+    linear_system.update(_linear_system_deflation(qc_metadata))
+
+    return {
+        "transpile_passes": transpile_passes,
+        "fixed_basis_summary": _fixed_basis_summary(transpile_passes),
+        "circuit_basis": SQLS_BASIS,
+        "circuit_timing_total_s": {
+            "generate": None,
+            "transpile": None,
+            "execute": round(total_solve, 6),
+            "total": round(total_solve, 6),
+        },
+        "linear_system": linear_system,
+        "file_inventory": file_inventory,
+        "_source": "solver",
+    }
 
 
 def _build_artifacts(
     qc_metadata: list[dict[str, Any]],
     file_inventory: dict[str, list[dict[str, Any]]],
+    sqls: bool = False,
 ) -> dict[str, Any]:
     """Build artifacts fragment with transpile_passes[], circuit_timing, linear_system."""
+    if sqls:
+        return _build_artifacts_sqls(qc_metadata, file_inventory)
     transpile_passes: list[dict[str, Any]] = []
     total_generate = 0.0
     total_transpile = 0.0
@@ -386,7 +714,11 @@ def _build_artifacts(
                 "depth": int(row.get("circ_depth_transpile", 0)),
                 "num_qubits": int(row.get("circ_qubits_transpile", 0)),
                 "gate_count": int(row.get("circ_gates_transpile", 0)),
+                "basis": HHL_BASIS,
+                "gate_count_scope": "all",
             },
+            "fixed_basis": _fixed_basis(row),
+            "deflation": _deflation(row),
         }
         transpile_passes.append(pass_entry)
 
@@ -404,9 +736,12 @@ def _build_artifacts(
             round(min(condition_numbers), 4),
             round(max(condition_numbers), 4),
         ]
+    linear_system.update(_linear_system_deflation(qc_metadata))
 
     artifacts: dict[str, Any] = {
         "transpile_passes": transpile_passes,
+        "fixed_basis_summary": _fixed_basis_summary(transpile_passes),
+        "circuit_basis": HHL_BASIS,
         "circuit_timing_total_s": {
             "generate": round(total_generate, 6),
             "transpile": round(total_transpile, 6),
@@ -424,17 +759,19 @@ def _build_artifacts(
 def _build_results(
     final_results: list[dict[str, float]],
     residuals: list[dict[str, float]],
-    outdir: Path,
+    per_iteration: list[dict[str, Any]],
+    stdout_text: str,
 ) -> dict[str, Any]:
     """Build results fragment with final_solution, per_iteration, residual_history."""
-    per_iteration = _extract_per_iteration_results(outdir)
-    lu_hhl_vectors = _parse_stdout_lu_solutions(outdir)
+    lu_hhl_vectors = _parse_stdout_lu_solutions(stdout_text)
 
-    # Merge LU/HHL solution vectors into per_iteration entries by index
+    # Merge LU/quantum solution vectors into per_iteration entries by index;
+    # key is <solver>_solution_vector (hhl_... or sqls_...)
     for idx, entry in enumerate(per_iteration):
         if idx < len(lu_hhl_vectors):
-            entry["lu_reference_vector"] = lu_hhl_vectors[idx]["lu"]
-            entry["hhl_solution_vector"] = lu_hhl_vectors[idx]["hhl"]
+            vecs = lu_hhl_vectors[idx]
+            entry["lu_reference_vector"] = vecs["lu"]
+            entry[f"{vecs['solver'].lower()}_solution_vector"] = vecs["qsol"]
 
     results: dict[str, Any] = {
         "final_solution": final_results,
@@ -450,10 +787,49 @@ def _build_results(
     return results
 
 
+def _last_dq_converged(
+    dq_by_step: dict[int, list[dict[str, float]]],
+    unsteady: bool,
+    nelem: int | None,
+) -> bool:
+    """Solver dq criterion on the last step: all per-equation ||dq|| <= 1e-10.
+
+    Mirrors nozzle_1d_solver.py (np.all(norm(q - qold, axis=1) <= 1e-10)):
+    the applied update is the 2nd dq CSV column, laid out (nelem, 3).
+    Valid for steady mode (one inner iteration per step). NaN: not converged.
+    """
+    if not dq_by_step or not nelem or unsteady:
+        return False  # unsteady naming (nsteps/iter): criterion not mapped
+    rows = dq_by_step[max(dq_by_step)]
+    if not rows:
+        return False
+    col = [k for k in rows[0] if k.startswith("dq_") and k != "dq_lu"]
+    if not col or len(rows) < 3 * nelem:
+        return False
+    dq = [float(r[col[0]]) for r in rows[: 3 * nelem]]
+    for eq in range(3):
+        norm = sum(dq[e * 3 + eq] ** 2 for e in range(nelem)) ** 0.5
+        if not norm <= 1e-10:  # NaN-safe, as np.all(dqnorm <= 1e-10)
+            return False
+    return True
+
+
+KERNEL_REL_ERR_DOC = (
+    "||A_q y - b|| / ||b|| (dimensionless) of the quantum solution y to the "
+    "system actually given to the circuit: A' (shifted) when deflate_k > 0, "
+    "A otherwise; HHL: after scaling, before the deflation recombination, "
+    "so independent of the classical share. SQLS writes the same column as "
+    "linsys_residual / ||b|| on the original system."
+)
+
+
 def _build_analysis(
     hhl_metrics: list[dict[str, float]],
     residuals: list[dict[str, float]],
     run_params: dict[str, Any],
+    dq_by_step: dict[int, list[dict[str, float]]] | None = None,
+    unsteady: bool = False,
+    stdout_text: str = "",
 ) -> dict[str, Any]:
     """Build analysis fragment with summary scalars and full per-iteration metrics."""
     # Top-level scalars from last iteration
@@ -471,7 +847,8 @@ def _build_analysis(
     for row in hhl_metrics:
         entry: dict[str, Any] = {"step": int(row.get("step", 0))}
         for key in ("fidelity", "l2_error_abs", "l2_error_rel",
-                    "l2_error_normalized", "linsys_residual"):
+                    "l2_error_normalized", "linsys_residual",
+                    "hhl_kernel_rel_err"):
             if key in row:
                 entry[key] = row[key]
         hhl_metrics_out.append(entry)
@@ -482,27 +859,55 @@ def _build_analysis(
         l2_error_normalized = last.get("l2_error_normalized")
         residual = last.get("linsys_residual")
 
-    # Residual reduction from CFD residual history
+    # Residual reduction from CFD residual history; the solver's res0
+    # (resnorm_init) is the denominator when the pickle records it
     residual_reduction = None
-    cfd_residual = None
     if residuals and len(residuals) >= 2:
-        first_res = residuals[0].get("residual_total")
+        first_res = run_params.get("resnorm_init") or residuals[0].get(
+            "residual_total"
+        )
         last_res = residuals[-1].get("residual_total")
-        cfd_residual = last_res
         if first_res and last_res and first_res != 0:
-            residual_reduction = round(last_res / first_res, 6)
-    elif residuals:
-        cfd_residual = residuals[-1].get("residual_total")
+            residual_reduction = last_res / first_res
 
-    # Convergence: check conv_tol from pickle or residual stagnation
-    converged = False
-    conv_tol = run_params.get("conv_tol")
-    if conv_tol is not None and cfd_residual is not None:
-        converged = cfd_residual <= conv_tol
+    # Convergence: newer solver pickles record converged / converged_by;
+    # use them as-is. Otherwise (all archived runs) mirror
+    # nozzle_1d_solver.py: stop when res/res0 < conv_tol (a RATIO) or all
+    # per-equation ||dq|| <= 1e-10, res0 being the first logged residual.
+    # The solver's banner after the last step line, or an early stop
+    # (0 < final_iters < max_iters - 1; the loop only breaks on
+    # convergence), is taken as its declaration.
+    if isinstance(run_params.get("converged"), bool):
+        converged = run_params["converged"]
+        converged_by = run_params.get("converged_by") if converged else None
+        converged_source = "solver"
+    else:
+        conv_tol = run_params.get("conv_tol")
+        final_iters = run_params.get("final_iters")
+        max_iters = run_params.get("max_iters")
+        criteria = {
+            "residual_ratio": (conv_tol is not None
+                               and residual_reduction is not None
+                               and residual_reduction < conv_tol),
+            "dq_norm": _last_dq_converged(
+                dq_by_step or {}, unsteady, run_params.get("nelem")
+            ),
+            "solver_stdout": _stdout_declares_converged(stdout_text),
+            "solver_early_stop": (final_iters is not None
+                                  and max_iters is not None
+                                  and int(max_iters) > 1
+                                  and 0 < int(final_iters)
+                                  < int(max_iters) - 1),
+        }
+        converged_by = next((k for k, ok in criteria.items() if ok), None)
+        converged = converged_by is not None
+        converged_source = "heuristic"
 
     analysis: dict[str, Any] = {
         "iterations_completed": iterations_completed,
         "converged": converged,
+        "converged_by": converged_by,
+        "converged_source": converged_source,
         "_source": "solver",
     }
     if fidelity is not None:
@@ -516,6 +921,20 @@ def _build_analysis(
     if residual_reduction is not None:
         analysis["residual_reduction"] = residual_reduction
     analysis["hhl_metrics"] = hhl_metrics_out
+
+    # Quantum kernel's own relative error per step (fvm 1c54a0d0 column;
+    # null for archived runs). Series is in hhl_metrics step order.
+    kernel = [_float_or_none(r.get("hhl_kernel_rel_err"))
+              for r in hhl_metrics if "hhl_kernel_rel_err" in r]
+    kernel_vals = [v for v in kernel if v is not None]
+    analysis["hhl_kernel_rel_err"] = kernel or None
+    analysis["hhl_kernel_rel_err_final"] = kernel[-1] if kernel else None
+    analysis["hhl_kernel_rel_err_median"] = (
+        statistics.median(kernel_vals) if kernel_vals else None
+    )
+    analysis["hhl_kernel_rel_err_doc"] = (
+        KERNEL_REL_ERR_DOC if kernel else None
+    )
 
     return analysis
 
@@ -547,6 +966,11 @@ def generate_metadata(
     final_results = _extract_final_results(outdir)
     residuals = _extract_residuals(outdir)
     file_inventory = _inventory_files(outdir)
+    stdout_text = _read_stdout(outdir)
+    dq_by_step, unsteady = _extract_dq_by_step(outdir)
+    per_iteration = _extract_per_iteration_results(outdir, dq_by_step)
+    sqls = _is_sqls(run_params, qc_metadata)
+    sqls_params = _sqls_params(run_params, qc_metadata) if sqls else None
 
     # Build case section (problem definition - solver-specific)
     case = {
@@ -574,12 +998,37 @@ def generate_metadata(
         "_source": "solver",
         "algorithm": run_params.get("linear_solver", "HHL"),
     }
+    if sqls_params is not None:
+        code["algorithm"] = "SQLS"
+        for key, val in sqls_params.items():
+            code[f"sqls_{key}"] = val
+    # Code provenance from the solver pickle (code_versions, fvm 4f44d5be+;
+    # absent in older runs): carried verbatim, plus flat commit keys.
+    code_versions = run_params.get("code_versions")
+    code["code_versions"] = code_versions
+    # fixed-basis counter mode (u3cx | none) and HHL scaling rule
+    # (leastsq | true_sol), fvm cca70256+; null when not recorded
+    code["circ_metrics"] = run_params.get("circ_metrics")
+    code["hhl_scale"] = (None if sqls_params is not None
+                         else run_params.get("hhl_scale"))
+    # HHL shifted-SVD deflation rank (fvm 8eb40832+; 0 = plain HHL)
+    code["hhl_deflate_k"] = run_params.get("hhl_deflate_k")
+    for name in ("fvm", "sqls", "linear_solvers"):
+        entry = (code_versions or {}).get(name)
+        code[f"{name}_commit"] = (
+            entry.get("commit") if isinstance(entry, dict) else None
+        )
 
     # Build fragment sections
-    backend = _build_backend(run_params, qc_metadata, outdir)
-    artifacts = _build_artifacts(qc_metadata, file_inventory)
-    results = _build_results(final_results, residuals, outdir)
-    analysis = _build_analysis(hhl_metrics, residuals, run_params)
+    backend = _build_backend(run_params, qc_metadata, stdout_text, sqls_params)
+    artifacts = _build_artifacts(qc_metadata, file_inventory, sqls=sqls)
+    results = _build_results(final_results, residuals, per_iteration,
+                             stdout_text)
+    analysis = _build_analysis(hhl_metrics, residuals, run_params,
+                               dq_by_step, unsteady, stdout_text)
+    analysis["deflation_summary"] = _deflation_summary(
+        artifacts["transpile_passes"]
+    )
 
     # Write solver-specific fragments (sweeper handles experiment, params, IDs)
     write_case(write_dir, case, experiment_id=experiment_id)
