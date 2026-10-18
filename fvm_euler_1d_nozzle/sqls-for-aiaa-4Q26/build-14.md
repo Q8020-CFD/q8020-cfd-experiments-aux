@@ -562,3 +562,133 @@ example, and the example uses `./q8020-cfd-metautil/.venv/bin/q8020-sweep`
  tests/examples/*.toml (4 files, pre-existing, not mine) | 2 +- each
  6 files changed, 512 insertions(+), 104 deletions(-)
 ```
+
+## 10. Rebase onto origin/main 2026-10-16T01:12Z-01:17Z
+
+**Setup.** The operator decided item 14 goes to `main`. It was one local
+commit, `3e88938`, based on `8ccab91`. `origin/main` had moved to
+`d75de45` with four commits:
+- `85c2220`: distributed MPI;
+- `cdf4bbb`: multi-rank fix;
+- `a1b2749`: synthesized srun launcher, `_env_exports`, recursive
+  templates;
+- `d75de45`: help text.
+
+I ran `git -C /Users/agallojr/proj/src/q8020/q8020-cfd-metautil rebase
+origin/main`. The result is again one commit, with the same message.
+Nothing was pushed, and `feature/solverfw-v2` is untouched at `753b97e`.
+
+**The upstream changes that matter for item 14:**
+- `_expand_templates_fixpoint` replaces the single-pass expansion.
+- The re-merge rule changed: group-level `_` keys now beat globals, and
+  only absent keys or `--set` keys are forced in from `[global]`.
+- `_synthesize_launcher_prefix` prepends `srun -N .. -n ..` to the group
+  executable in SLURM parallel mode.
+- `_env_exports` reaches local and interactive runs through
+  `_resolve_env_exports`, and SLURM runs through `export` lines in the
+  sbatch.
+- The sbatch is sized for one case when `_slurm_tasks_per_case > 1`.
+
+**Conflicts and resolutions:**
+
+1. `src/q8020_cfd_metautil/sweep.py`, the only textual conflict. It sat
+   at the end of the `--set` loop, where item 14 had moved the loop into
+   `_apply_overrides` and upstream had rewritten the comment above the
+   expansion call (now `_expand_templates_fixpoint`).
+   - Kept item 14's `return resolved_override_keys`, the new `run_sweep`
+     signature, the `_apply_overrides(...)` call and
+     `_fallback_postproc_venv(global_params, dry_run)`.
+   - Kept upstream's fixpoint comment and the fixpoint calls.
+2. `README.md` auto-merged with no conflict. Upstream's sections
+   (recursive templates, the `_env_exports` table and prose, the
+   `_slurm_tasks_per_case` / `_slurm_launcher` rows, distributed cases)
+   sit beside the item-14 text. I checked that nothing contradicts.
+
+**Semantic re-wiring** (no textual conflict, but needed so item 14 fits
+the new code):
+
+3. `_fallback_postproc_venv` now expands `_postproc_venv` with
+   `_expand_templates_fixpoint`, consistent with recursive templates.
+4. The multi-stage base `_output_dir` is expanded with
+   `_expand_templates_fixpoint`, after `_apply_overrides`.
+5. `_env_exports` now show in a dry run:
+   - locally or interactive: `Env export: NAME=value` header lines;
+   - SLURM plain dry run: `export NAME="value"  (_env_exports)` after
+     the `#SBATCH` header.
+   README sentence added.
+6. The launcher synthesis needed no change. The synthesized prefix is
+   part of `group_executable`, so the item-14 dry-run printer and the
+   post-NVMe-rewrite printer show it.
+7. `tests/test_sweep_launcher_env.py` is an upstream test that asserted
+   on `pipeline_args.json` written by a plain `run_sweep(dry_run=True)`.
+   Item 14 deliberately removed that write. The 10 dry-run calls now
+   pass `dry_run=True, dry_run_materialize=True` through a
+   `_MATERIALIZE` constant, and the module docstring says so. The
+   assertions are unchanged. The non-dry `_env_exports` test is
+   unchanged.
+
+**Verification on the committed tree** (`9ce8669`):
+- `py_compile` is clean.
+- Full suite: `.venv/bin/python -m pytest -q -p no:cacheprovider tests`
+  gives **43 passed in 3.71 s**. Upstream `origin/main` alone, run from
+  a `git archive` export, also gives 43 passed.
+
+Dry runs from cwd `/Users/agallojr/proj/src/q8020`, each with
+`--set _postproc_venv=./q8020-cfd-metautil/.venv` and
+`--set _output_dir=/tmp/metautil-rebase/<name>`:
+
+| name | TOML and args | cases | `Command:` | `Postproc (dry-run)` | `/mnt/bb` commands | `#SBATCH` lines | `find` count |
+|---|---|---|---|---|---|---|---|
+| cfl | `fvm_cfl_sweeps.toml --dry-run` | 70, parallel | 70 | 70 | 0 | 0 | 0 |
+| cflslurm | same, `--set _slurm=true` | 70, parallel (slurm) | 70 | 70 | 70 | 8 (`-N 70 -A ard189 -t 02:00:00 -C nvme -p batch`) | 0 |
+| smoke | `tests/examples/fvm_1d_smoke_test.toml --dry-run` | 66, parallel | 66 | 66 | 0 | 0 | 0 |
+| sqls | SQLS draft, 5 groups named | 146, sequential | 146 | 146 | 0 | 0 | 0 |
+
+Multi-stage check: `multi_stage_local.toml --dry-run-materialize`
+wrote exactly one file,
+`/tmp/metautil-rebase/ms/2026-10-16/_50224be5/q8020_sweep_invocation.json`.
+It has all 11 keys, and `metautil` reads
+`{'version': '0.1.0', 'commit': '9ce8669122ff7e6dba84110434162dce64a04e01',
+'branch': 'main', 'dirty': False, 'commit_source': 'git'}`.
+
+Upstream launcher check on `tests/examples/all_directives_reference.toml`:
+- Local dry run: 36 cases, an `Env export: Q8020_DEMO_VAR=1` line, 0
+  entries written.
+- `ideal --set _slurm=true --set _run_mode=parallel --set
+  _slurm_tasks_per_case=16`:
+  - `Command: bash -c "source .../.venv/bin/activate && srun -N 2 -n 16
+    --ntasks-per-node=8 --exclusive python3 examples/smoke_test_solver.py ..."`;
+  - `#SBATCH -N 2`;
+  - `export Q8020_DEMO_VAR="1"  (_env_exports)`;
+  - 0 entries written.
+
+`find ~/q8020 -newer <marker>` = 0.
+
+**Hygiene against origin/main:** in `src`, `README.md` and the test
+file, no added line is over 88 chars and no line has trailing
+whitespace. The 4 `tests/examples/*.toml` lines from the original commit
+(the harvester-path fix) are TOML command strings of 104 and 163 chars.
+They were already that long in the files they replace; PEP 8 does not
+apply to TOML.
+
+```
+$ git log --oneline origin/main..main
+9ce8669 Sweeper housekeeping: record the invocation, write nothing on dry-run, UTC date dir, venv fallback on dry-run only, fix harvester paths in the fvm examples
+$ git diff --stat origin/main..main
+ README.md                                | 125 +++++++-
+ src/q8020_cfd_metautil/sweep.py          | 492 +++++++++++++++++++++++++------
+ tests/examples/base_case.toml            |   2 +-
+ tests/examples/base_case_hhl.toml        |   2 +-
+ tests/examples/fvm_1d_smoke_test.toml    |   2 +-
+ tests/examples/hhl_time_step_impact.toml |   2 +-
+ tests/test_sweep_launcher_env.py         |  31 +-
+ 7 files changed, 539 insertions(+), 117 deletions(-)
+```
+
+**Doubts:**
+- Under the new merge rule, a group that sets its own `_postproc_venv`
+  keeps it. `_fallback_postproc_venv` checks only the `[global]` value,
+  so a missing group-level venv is not caught.
+- The dry-run printout for distributed (`_slurm_tasks_per_case > 1`)
+  SLURM sweeps was checked only on the reference TOML, not on a real MPI
+  case.
