@@ -1,0 +1,1617 @@
+--- a/README.md
++++ b/README.md
+@@ -185,6 +185,8 @@
+ | `-seed` | None | Seed for the shot sampler (Aer `seed_simulator` for HHL ideal/fake, `quantum_solve(seed=)` for SQLS); same seed, same counts. Recorded even when statevector |
+ | `-hhl_scale` | leastsq | HHL only. `leastsq`: least-squares alpha = <b, A x>/<A x, A x> from A and b alone (fixes sign and magnitude; what every April, August and current run executed, the former default `true_scale` was invalid and fell through to this branch). `true_sol`: magnitude from the classical LU norm of the Hermitian system, sign from ||A(+-x) - b||. Recorded as `hhl_scale` in the pickle |
+ | `-hhl_deflate_k` | 0 | HHL only. Classical shifted SVD deflation of the K smallest singular triplets of the Newton Jacobian before HHL (0 = off; needs 0 <= K < 3*nelem); see "Hybrid SVD-deflated HHL" below. Recorded as `hhl_deflate_k` in the pickle |
++| `-hhl_spectrum` | internal | HHL only. Source of the spectral data that scales the system and sizes the circuit. `internal`: the path as before (spectral-radius scale, the library's own full SVD and eigendecomposition of the encoded matrix). `deflation`: needs `-hhl_deflate_k K >= 1`; scale and bounds come from the pre-step SVD, see "Supplied spectrum" below. Recorded as `hhl_spectrum` in the pickle and the qc_metadata CSV |
++| `-hhl_spectral_diag` | on | HHL only. `off` skips the diagnostic `condition_number` / `lambda_*` columns (full dense cond and eigvals; empty cells); valid with `-hhl_spectrum deflation` only |
+ | `-circ_metrics` | u3cx | Shared fixed-basis circuit counter for HHL and SQLS alike (`u3cx`: transpile to {u3, cx} at optimization_level 0 on every step, see below; `u3cx-once`: count the first HHL step only and reuse it while the circuit keeps its (qubits, instruction count), an assumption; `none` skips it (empty cells)) |
+ | `-sqls_method`, `-sqls_k`, `-sqls_state_prep`, `-sqls_repeats` | full_svd, N//2, initialize, 1 | SQLS assembly method, truncation rank, state-prep loader, shot-mode repeats |
+ | `-outdir` | . | Output directory for results |
+@@ -266,7 +268,8 @@
+ of the same circuit took 14.2 s, the statevector run 51.3 s).
+ 
+ The metadata pickle of a quantum run carries `effective_shots`, `seed`,
+-`circ_metrics` and, for HHL, `hhl_scale` and `hhl_deflate_k`, next to
++`circ_metrics` and, for HHL, `hhl_scale`, `hhl_deflate_k`, `hhl_spectrum`
++and `hhl_spectral_diag`, next to
+ `backend_type`, `backend_method`, `nshots` and `quantum_circuit`.
+ 
+ ### Hybrid SVD-deflated HHL (`-hhl_deflate_k`, work-plan item 6)
+@@ -337,7 +340,85 @@
+ to any HHL saving, preferably at the steady iteration-14 Jacobian rather
+ than at iteration 0. Reusing the deflation space across Newton iterations
+ is future work.
++
++### Supplied spectrum (`-hhl_spectrum`, work-plan item 19)
++
++The HHL path needs three spectral numbers: a scale for A, the condition
++number kappa of the encoded matrix (it sizes the clock register,
++`nl = max(nb + 1, ceil(log2(kappa + 1))) + 1`), and the bounds lambda_min,
++lambda_max of its |eigenvalues| (they set the reciprocal constant and the
++evolution time). By default (`-hhl_spectrum internal`) fvm scales A by its
++spectral radius (a full `np.linalg.eig`), and the HHL library computes
++kappa and the bounds itself (`NumPyMatrix.condition_bounds()`, a full SVD,
++and `eigs_bounds()`, a full eigendecomposition). A deflated run then pays
++for these on top of the pre-step SVD.
++
++`-hhl_spectrum deflation` (with `-hhl_deflate_k K >= 1`) takes all three
++from the pre-step instead. The library is called with
++`construct_circuit(..., condition_bound=, eigenvalue_bounds=)` (fork API,
++`linear_solvers.SpectralInfo` records what it used), so neither of its
++internal calls runs, and fvm scales A' by sigma_max, so no eig of A' runs.
++
++How the values follow from the SVD of the ORIGINAL A (0-based ascending,
++sigma_K the (K+1)-th smallest, sigma_max the largest):
++
++1. A' keeps sigma_K .. sigma_max of A and parks K values at sigma_max, so
++   sigma_min(A') = sigma_K and sigma_max(A') = sigma_max.
++2. Scaling by s divides every singular value by s. With s = sigma_max they
++   lie in [sigma_K / sigma_max, 1].
++3. Padding to the next power of 2 adds an identity block. Its singular
++   values are 1, inside that range, so they change no bound.
++4. Hermitian doubling H = [[0, P], [P^H, 0]] has eigenvalues +- the
++   singular values of P. So |eig(H)| are exactly those singular values.
++
++The encoded matrix therefore has lambda_min = sigma_K / sigma_max,
++lambda_max = 1 and kappa = sigma_max / sigma_K = `kappa_eff`. In general,
++for any scale s with sigma_min <= s <= sigma_max of the matrix handed to
++HHL, lambda_min = sigma_min / s, lambda_max = sigma_max / s, kappa =
++sigma_max / sigma_min; the default s = spectral radius always satisfies
++this, so the same identity describes the internal path. `hhl_spectrum.py`
++holds the derivation and `tests/test_hhl_spectrum.py` checks it to 1e-10
++against `np.linalg.cond` / `eigvals` of H on every archived Jacobian.
+ 
++The HHL circuit depends on A only through A / lambda_min and the ratio
++lambda_min / lambda_max, so the different scale gives the same quantum
++solve of the system block. Only the small absolute offsets fvm adds to b
++(1e-12 on every entry, 1e-8 on the padded entries) do not scale with s,
++which leaves round-off-level differences. Measured at nelem 2, K = 1 (archived iteration
++0): same clock register (6 qubits), and the solution differs from the
++default deflated path by 1.9e-12 max-abs and from the internal bounds of
++the same encoded matrix by 1.1e-14. The circuit itself differs (the
++padding block sits at another phase), so its qpy files are keyed
++`..._deflate<K>_specdeflation.qpy`. Supplying exactly the internal values
++gives the identical circuit (`quantum_tools.circuit_key`).
++
++Six HHL `qc_metadata` columns sit after `t_svd_s`:
++
++| column | type | meaning |
++|---|---|---|
++| `hhl_spectrum` | str | `internal` or `deflation`; empty only for a `-loadcirc` circuit saved before item 19 |
++| `hhl_a_scale` | float | the scale s: A_q / s before padding (the spectral radius, or sigma_max under `deflation`) |
++| `hhl_kappa` | float | kappa of the encoded Hermitian matrix that sized the clock register |
++| `hhl_lambda_min`, `hhl_lambda_max` | float | its |eigenvalue| bounds used for the circuit (lambda_min after the library's near-zero substitution) |
++| `t_spectrum_s` | float, s | wall time of this step's spectral work for the circuit: the spectral-radius eig plus the library's bound calls (that part is inside `circ_generate_time`); 0.0 under `deflation`, whose cost is `t_svd_s` |
++
++The pickle carries `hhl_spectrum` and `hhl_spectral_diag` next to
++`hhl_deflate_k`, and `quantum_circuit` carries the last step's
++`hhl_spectrum`, `hhl_a_scale`, `hhl_kappa`, `hhl_lambda_min`,
++`hhl_lambda_max`. The generated and transpiled qpy files keep the same
++record in their circuit metadata, so `-loadcirc` restores it.
++
++Diagnostics. `condition_number` and `lambda_*_orig` / `lambda_*_scaled` are
++metadata only (two full cond and two eigvals per step, outside every
++timing). `-hhl_spectral_diag off` skips them (empty cells; deflation only,
++since at K = 0 `kappa` is that condition number). The determinant and
++condition-number prints of `math_tools` run at `-v 1` and above only; with
++`-v 0 -hhl_spectrum deflation -hhl_spectral_diag off` the only dense
++spectral call left on the path is the pre-step SVD. At these sizes the
++saving is small (the library's two calls took 0.2 ms on the 32 x 32
++nelem-5 system, against 26 s of circuit construction); it matters for the
++item-18 cost comparison and at larger N.
++
+ ### What is classical in each quantum path
+ 
+ - SQLS statevector: the returned `dq` is the Aer statevector slice, scaled
+@@ -372,6 +453,7 @@
+ ├── time_solvers.py           # Time integration (RK, BDF, linear solvers)
+ ├── quantum_tools.py          # Quantum HHL implementation
+ ├── deflation.py              # Shifted SVD deflation around HHL (item 6)
++├── hhl_spectrum.py           # Supplied HHL spectrum from the pre-step (item 19)
+ ├── case.py                   # Problem setup (physics, BCs, nozzle)
+ ├── mesh.py                   # 1D grid generation
+ ├── math_tools.py             # Utilities (matrix ops, HHL prep)
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -137,6 +137,20 @@
+ contract test now checks the pinned revs and `commit_source: direct_url`.
+ Measured 2026-10-18 on the same stack: unittest **157 tests, 156 pass, 1
+ skipped, 198.6 s** (200.2 s process).
++
++Item 19 (supplied HHL spectrum, 2026-10-18T23:19Z to 23:24Z, same stack,
++the HHL fork installed as the editable dev override of its working tree,
++`uv pip install -e ../quantum_linear_solvers --no-deps`, because the new
++fork API is not committed yet): unittest **180 tests, 175 pass, 4 fail, 1
++skipped, 272.1 s** (273.7 s process). The 23 new tests are in
++`tests/test_hhl_spectrum.py` (section (m)). The 4 failures are the four
++`test_code_versions` cases: under the documented dev override
++`linear_solvers` reports `commit_source: git` (and `dirty` True) instead
++of the pinned `direct_url` install. They pass again once the fork commit
++is pushed, its `rev` bumped in `pyproject.toml`, and `uv lock && uv sync`
++replaces the override. No DeprecationWarning under `-W
++default::DeprecationWarning`; the longest single test is 32.2 s
++(`TestSuppliedExactValuesSameCircuit.test_nelem5_iter0_k1`).
+ 
+ Opt-in gate (adds the ~90 s nelem-5 HHL fixture solve; see "Gate fixtures"):
+ 
+@@ -183,13 +197,14 @@
+ |---|---|
+ | `tests/__init__.py` | Puts the repo root on `sys.path` when the package is imported, so every module imports the solver modules at the top (stdlib / third-party / local) right after `from tests import helpers`. |
+ | `tests/helpers.py` | Run the CLI into a temp dir under `sys.executable` (cached by argument list so one HHL run serves several test classes), parse CSV/pickle outputs, build `LinearSystemSolver` in-process exactly as the CLI does; shared run argument lists. |
+-| `tests/contract.py` | The output contract as data: file-name patterns, CSV column lists (incl. the item-11 `QC_METADATA_FAIRNESS_COLUMNS` shared by both solvers), metadata-pickle keys (incl. the `71c02aed` convergence record, the item-12 `code_versions` record and the item-11 `circ_metrics` / `seed` / `effective_shots` / `hhl_scale` keys), harvester globs. Extend deliberately when a column or file is added (work-plan items 10, 11). |
++| `tests/contract.py` | The output contract as data: file-name patterns, CSV column lists (incl. the item-11 `QC_METADATA_FAIRNESS_COLUMNS` shared by both solvers), metadata-pickle keys (incl. the `71c02aed` convergence record, the item-12 `code_versions` record, the item-11 `circ_metrics` / `seed` / `effective_shots` / `hhl_scale` keys and the item-19 `hhl_spectrum` / `hhl_spectral_diag` keys and spectrum columns), harvester globs. Extend deliberately when a column or file is added (work-plan items 10, 11). |
+ | `tests/test_classical.py` | (a) LU nelem 2, GMRES nelem 3, LU nelem 5 to convergence (with its metadata convergence record). |
+ | `tests/test_sqls.py` | (b) SQLS statevector nelem 2 and 5, capped and run to convergence; (c) SQLS shots nelem 2; item-9 converged-step shots fidelity; padding and backend-type unit checks; zero right-hand side; `SQLS back-end unavailable` message; the unpatched-sqls constructor probe; (g) item-11 reference-free sign rule, (i) seeded SQLS shots, (j) `effective_shots`. |
+ | `tests/test_hhl.py` | (d) HHL statevector nelem 2, two Newton steps; HHL ideal shots nelem 2 (1000 shots, one step); `run_circuit_ibm` on a Bell circuit, ideal and fake; `HHL back-end unavailable` message; (i) seeded HHL shots and `_run_on_backend` seed plumbing (Aer backends only); (k) `-hhl_scale`. |
+ | `tests/test_circuit_metrics.py` | (h) item-11 shared fixed-basis counter `quantum_tools.count_circuit_metrics` on tiny known circuits, its `fb_*` columns in the cached SQLS and HHL runs (the HHL one-entry count cache, `fb_cached`), `-circ_metrics none` and an invalid mode. |
+ | `tests/test_cli.py` | (e) argument validation (item 7): `-sqls_k`, backend type and method, `-v` banner; unit tests of `math_tools.resolve_sqls_k`; `-h` lists `-seed` / `-circ_metrics` / `-hhl_deflate_k`; `-hhl_scale true_scale` rejected. |
+ | `tests/test_output_contract.py` | (f) exact file set, harvester globs, columns (incl. the nine item-11 fairness columns and `hhl_kernel_rel_err`), metadata keys and values (incl. the capped-run convergence record and the item-11 pickle keys) for one SQLS, one HHL, one HHL shots and one LU run; per-step CSV header rotation (helper and CLI). |
++| `tests/test_hhl_spectrum.py` | (m) item-19 supplied HHL spectrum: the singular-value to encoded-bound transformation on every archived Jacobian and two synthetic systems, identical circuits from supplied exact internal values (nelem 2, nelem 5 k = 1), the nelem-2 k = 1 equivalence of `-hhl_spectrum deflation` with the internal computation, the dense spectral calls per configuration, the new columns / pickle keys / qpy record, parse-time rejections. |
+ | `tests/test_deflation.py` | (l) item-6 hybrid SVD-deflated HHL: the 06a dry check reproduced through `deflation.py` on the archived April CFL-1e10 iteration-14 / 0 Jacobians, the shifted-deflation identity on every archived system, the six metadata columns, one nelem-2 `-hhl_deflate_k 1` CLI run against the cached k = 0 run (incl. the kernel error and the `_deflate1` qpy key), parse-time rejections, the `-loadcirc` refusal. |
+ | `tests/deflation_drycheck.py` | The dry-check script's clock-width, state-register, P_succ-proxy and b-share formulas (test-only; the solver never uses them). |
+ | `tests/test_gate_fixture.py` | Item-15 gate: HHL and SQLS statevector solves on archived systems vs stored references, 1e-10 max-abs. |
+@@ -583,8 +598,8 @@
+   the qpy circuits, which carry the `_deflate1` key
+   (`circuit_generated_statevector_nelem2_iter0_deflate1.qpy`;
+   `expected_files(..., deflate_k=1)`), and the same
+-  `QC_METADATA_HHL_COLUMNS` (six deflation columns before the nine fairness
+-  columns; `fb_cached` False, `t_count_s` > 0 on the single step);
++  `QC_METADATA_HHL_COLUMNS` (six deflation columns, then the six item-19
++  spectrum columns, before the nine fairness columns; `fb_cached` False, `t_count_s` > 0 on the single step);
+   `deflate_k` 1 / 0; `kappa` 38.306 in both (same step-0 Jacobian),
+   `kappa_eff` 6.850 = `condition_number` at k = 1 and = `kappa` at k = 0;
+   `n_clock` 6 / 7, `circ_qubits` 11 / 12 = `nqubits` + `n_clock` + 1;
+@@ -606,7 +621,75 @@
+   -hhl_deflate_k 1` and the missing `_deflate1.qpy`, the process exits
+   non-zero, and no `.qpy` or `qc_metadata` file is written (a k = 0 circuit
+   is never reused for A').
++
++### (m) Supplied HHL spectrum, `test_hhl_spectrum.py` (item 19, one extra ~8 s HHL run)
++Output-contract change: six HHL `qc_metadata` columns
++(`contract.QC_METADATA_SPECTRUM_COLUMNS`: `hhl_spectrum, hhl_a_scale,
++hhl_kappa, hhl_lambda_min, hhl_lambda_max, t_spectrum_s`) between
++`t_svd_s` and the nine fairness columns; two pickle keys (`hhl_spectrum`,
++`hhl_spectral_diag`, in `METADATA_KEYS_HHL_ONLY`); five more
++`quantum_circuit` keys for HHL (`hhl_spectrum` and the four values); the
++qpy names of `-hhl_spectrum deflation` runs end `_specdeflation`
++(`expected_files(..., hhl_spectrum=)`). Every existing column, key and
++default-run file name is unchanged. Under `-hhl_spectral_diag off` the
++five diagnostic columns (`QC_METADATA_DIAGNOSTIC_COLUMNS`) are empty
++cells, the same convention as the fb_* columns under `-circ_metrics none`.
+ 
++- Transformation (in-process, < 0.1 s): with the encoded matrix built by
++  the solver's own `scale_Ab` / `convert_to_pow2` / `convert_system_to_herm`
++  and s = sigma_max, `encoded_spectrum(defl)` (kappa = `kappa_eff`,
++  lambda_min = sigma_k / sigma_max, lambda_max = 1) equals
++  `NumPyMatrix(H).condition_bounds()[1]` and `eigs_bounds()` to 1e-10
++  relative, and gives the same clock width, on all nine archived systems
++  for k = 1 to 4 and on fixed synthetic 8 x 8 (no padding) and 5 x 5 (3 pad
++  rows) systems for k = 1 to 3. The same identity with s = the spectral
++  radius (the default path) for k = 0 to 2. `encoded_bounds` rejects a
++  scale outside [sigma_min, sigma_max]. Constants and the `_specdeflation`
++  suffix match the contract.
++- Identical circuit (in-process; nelem 2 k = 0 and 1: 7.0 s and 3.3 s;
++  nelem 5 iteration 0, k = 1: 32.2 s): `QuantumHHL.generate_circuit` with
++  the exact internal values supplied, `NumPyMatrix.condition_bounds` /
++  `eigs_bounds` patched to raise, gives the `quantum_tools.circuit_key` of
++  the internal build, the same clock register and the same recorded
++  values; library time 0.0; the record is in `circ.metadata`. (nelem 5 at
++  k = 0 builds in 26 s per circuit, so its two builds exceed 60 s; it was
++  checked once outside the suite, see build-19.md in the experiments repo.)
++- Equivalence at nelem 2, k = 1 (in-process `hhl_solve` on the archived
++  nelem-2 system, three solves, ~15 s in setUpClass): `-hhl_spectrum
++  deflation -hhl_spectral_diag off` has `n_clock` 6, equal to the internal
++  default and to the internal bounds of the same encoded matrix (A' /
++  sigma_max; the reference run drops the spectrum and keeps its scale);
++  `dq` within 1e-10 max-abs of both (observed 1.1e-14 and 1.9e-12). The
++  recorded `hhl_a_scale` = sigma_max, `hhl_kappa` = `kappa_eff`,
++  `hhl_lambda_max` 1.0, `t_spectrum_s` 0.0, the diagnostic cells empty;
++  internal: `hhl_kappa` = `kappa_eff` to 1e-10, `hhl_a_scale` =
++  `lambda_max_orig`, `t_spectrum_s` > 0. A `numpy.linalg` / `scipy.linalg`
++  call log (svd, cond, eig, eigvals, eigh, eigvalsh called directly from
++  the fvm modules or the fork) shows only the pre-step `svd` under
++  deflation + diagnostics off at `-v 0`, and for the internal default the
++  pre-step svd, two diagnostic cond + eigvals, the spectral-radius eig and
++  the library's one cond + one eigvals. The option rules raise
++  `ValueError` in `LinearSystemSolver`.
++- CLI (`... -hhl_deflate_k 1 -hhl_spectrum deflation -hhl_spectral_diag
++  off`, ~8 s) next to the cached internal k = 1 and k = 0 runs: file set
++  with the `_specdeflation` qpy names, `QC_METADATA_HHL_COLUMNS`;
++  `n_clock` / `circ_qubits` equal to the internal k = 1 run, `hhl_kappa`
++  equal to its value to 1e-10, `dq_hhl` within 1e-10 max-abs; k = 0:
++  `hhl_kappa` = `condition_number`, `hhl_a_scale` = `lambda_max_orig`,
++  bounds sigma_min / s and sigma_max / s of A. Pickle keys and values,
++  `quantum_circuit` equal to the CSV row. Both saved qpy files contain the
++  spectrum record. A real `-loadcirc` reload cannot be tested: qpy on
++  qiskit 2.5.2 fails to rebuild `ExactReciprocalGate`
++  (`TypeError: ExactReciprocalGate.__init__() missing 2 required
++  positional arguments`), on the default path too (pre-existing); the
++  read-back from `circ.metadata` is tested in-process with `qpy.load`
++  replaced (`TestLoadedCircuitRecord`, 1.4 s), including the empty cells
++  of a circuit saved without a record.
++- Rejections at parse time (exit 2, nothing written): `-hhl_spectrum
++  deflation` without `-hhl_deflate_k` or with 0; `-hhl_spectral_diag off`
++  with `-hhl_spectrum internal`; either flag with `-linsolver` LU / SQLS;
++  an unknown choice.
++
+ ### Gate fixtures, `test_gate_fixture.py`
+ Work-plan item 15 (HHL fork port off the qiskit 3.0 removals) is gated on
+ reproducing the pre-port HHL statevector solution on an archived 15 x 15
+--- a/math_tools.py
++++ b/math_tools.py
+@@ -1,7 +1,9 @@
+-import numpy as np
+ import math
++import time
+ 
++import numpy as np
+ 
++
+ # Global verbosity setting
+ # 0: No output (silent mode)
+ # 1: Basic information (default)
+@@ -34,6 +36,22 @@
+ # the CLI can list them without importing qiskit on the classical path.
+ CIRC_METRICS_CHOICES = ('none', 'u3cx', 'u3cx-once')
+ CIRC_METRICS_DEFAULT = 'u3cx'
++# -hhl_spectrum choices (item 19): where the spectral data that scales the
++# HHL system and sizes its circuit comes from. 'internal' (default, the
++# path as before): fvm scales A by its spectral radius (np.linalg.eig) and
++# the HHL library computes the condition number and eigenvalue bounds of
++# the encoded matrix itself (full SVD and eigendecomposition).
++# 'deflation': with -hhl_deflate_k K >= 1, fvm scales A' by sigma_max and
++# hands the library kappa and the eigenvalue bounds derived from the
++# pre-step SVD (deflation.encoded_spectrum), so neither runs.
++HHL_SPECTRUM_CHOICES = ('internal', 'deflation')
++HHL_SPECTRUM_DEFAULT = 'internal'
++# -hhl_spectral_diag choices (item 19): 'on' (default) computes the
++# diagnostic condition_number / lambda_* qc_metadata columns (full dense
++# cond and eigvals of A_q and of the scaled A_q); 'off' skips them (empty
++# cells) and is valid only with -hhl_spectrum deflation.
++HHL_SPECTRAL_DIAG_CHOICES = ('on', 'off')
++HHL_SPECTRAL_DIAG_DEFAULT = 'on'
+ 
+ 
+ def deflate_suffix(deflate_k: int) -> str:
+@@ -44,6 +62,14 @@
+   return f'_deflate{int(deflate_k)}' if deflate_k else ''
+ 
+ 
++def spectrum_suffix(hhl_spectrum: str) -> str:
++  """qpy file-name key of the item-19 spectrum source: '' for 'internal'
++  (every earlier name), '_spec<source>' otherwise, since that path scales A'
++  by sigma_max instead of the spectral radius and so encodes a different
++  matrix. Shared by QuantumHHL.qpy_path and tests/contract.py."""
++  return '' if hhl_spectrum == 'internal' else f'_spec{hhl_spectrum}'
++
++
+ def resolve_sqls_k(k: int | None, n: int, method: str) -> int:
+   """Single SQLS rank rule: k defaults to n//2; the truncated methods need
+   a power of 2 with 2 <= k < n. k is not validated for full_svd (ignored
+@@ -110,7 +136,7 @@
+     # Filling the diagonals of the padded region with 1s so that the matrix is not singular
+     np.fill_diagonal(A_padded[-padding_rows:,-padding_cols:], 1.0)
+ 
+-    # Print the padded array
++    # Print the padded array (diagnostic (d): det and cond, print only)
+     if verbosity:
+       print(f'\n==================== Print (N)^2 padded matrix system '
+               f'=======================')
+@@ -150,6 +176,7 @@
+     bherm_pad = np.ones(nsys)*eps
+     B_herm = np.hstack( (B, bherm_pad) ) + 1e-12 #+ offset*np.linalg.norm(B)
+ 
++  # diagnostic (d): det and cond, print only
+   if verbosity:
+     N_herm = A_herm.shape[0]
+     print(f'\n==================== Print Hermitian matrix system info '
+@@ -169,19 +196,36 @@
+       print_matrix_scientific(B_herm, precision=2)
+   return A_herm, B_herm
+ 
+-def scale_Ab_by_spectral_radius(A, b, verbosity=None):
++
++def scale_Ab(A, b, verbosity=None, rho=None):
++  """A / rho, b / rho, rho and t_rho_s, the wall seconds spent computing
++  rho. rho None (default, the path as before): the spectral radius of A,
++  class (b) of the item-19 inventory -- a full dense np.linalg.eig at
++  N <= 200, a 20-step unseeded power-iteration estimate above. A given rho
++  (item 19: -hhl_spectrum deflation passes sigma_max of A') skips every
++  spectral call, t_rho_s = 0.0, and the verbosity >= 1 print shows rho
++  only."""
+   if verbosity is None:
+     verbosity = get_verbosity()
+   N = A.shape[0]
++  if rho is not None:
++    rho = float(rho)
++    if verbosity:
++      print(f'\nA info: before HHL prepare: scale supplied, rho = {rho:.3e} '
++            f'(no spectral computation)')
++      print("-"*80)
++    return A/rho, b/rho, rho, 0.0
++  t_rho = time.perf_counter()
+   if N > 200: #large matrix for eigen value computations
+     lambda_max = matrix_spectral_radius_estimate(A)
+-    lambda_min = lambda_max/np.linalg.cond(A)
++    lambda_min = None  # diagnostic (d): computed below for the print only
+   else:
+     Le, _ = np.linalg.eig(A)
+     Le = np.sort(np.abs(Le))
+     lambda_max = Le[-1]
+-    lambda_min = Le[0]
++    lambda_min = Le[0]  # diagnostic (d): printed only
+   rho = lambda_max
++  t_rho = time.perf_counter() - t_rho
+ 
+   if verbosity==2:
+     print("\n"+"-"*30+"Original system"+"-"*30)
+@@ -194,7 +238,10 @@
+     print_matrix_scientific(b)
+     print("-"*150)
+     
++  # diagnostic (d), print only: cond and det below
+   if verbosity:
++    if lambda_min is None:
++      lambda_min = lambda_max/np.linalg.cond(A)
+     print(f'\nA info: before HHL prepare:')
+     print(f'Spectral radius (A): {rho:.3e}, lambda_min:{lambda_min}')
+     print(f'condition number(A): {lambda_max/lambda_min:.3e}, '
+@@ -205,7 +252,9 @@
+   A_scaled = A/rho
+   b_scaled = b/rho
+ 
+-  if N <= 200:
++  # diagnostic (d), print only: skipped at verbosity 0 (it used to run and
++  # be discarded there)
++  if N <= 200 and verbosity:
+     lambda_hhl, _ = np.linalg.eig(A_scaled)
+     lambda_hhl = np.sort(np.abs(lambda_hhl))
+     lambda_max_hhl = lambda_hhl[-1]
+@@ -221,8 +270,15 @@
+           f'nnz: {np.count_nonzero(A_scaled)/N:.0f} non zeros per row')
+       print("-"*80)
+ 
+-  return A_scaled, b_scaled, rho
++  return A_scaled, b_scaled, rho, t_rho
+ 
++
++def scale_Ab_by_spectral_radius(A, b, verbosity=None):
++  """A / rho, b / rho, rho with rho the spectral radius of A (scale_Ab
++  with no supplied rho, without the timing)."""
++  return scale_Ab(A, b, verbosity=verbosity)[:3]
++
++
+ def matrix_spectral_radius_estimate(A, niter=20):
+   n = A.shape[0]
+   v = np.random.randn(n)
+@@ -286,7 +342,10 @@
+   return q
+ 
+ def get_matrix_properties(A, compute_eigenvalues=True):
+- 
++  """Diagnostic (c) metadata: size, condition number (full SVD),
++  determinant, nnz per row and |eigenvalue| bounds (full eigvals at
++  N <= 200). Not used to build any circuit; QuantumHHL skips it under
++  -hhl_spectral_diag off."""
+   N = A.shape[0]
+   props = {
+     'size': N,
+--- a/nozzle_1d_solver.py
++++ b/nozzle_1d_solver.py
+@@ -1,7 +1,7 @@
+ from mesh import Mesh
+ from case import SimCase
+ from time_solvers import (RK1, RK2, RK3, BDFTimeSolver, HHL_SCALE_TYPES,
+-    HHL_SCALE_DEFAULT)
++    HHL_SCALE_DEFAULT, check_hhl_spectrum)
+ from space_solvers import SpaceSolver
+ from helper_tools import (write_csv, plot_solution_and_residual,
+     get_code_versions)
+@@ -128,6 +128,30 @@
+              f'deflate_k, kappa, kappa_eff, n_clock, x_share_classical, '
+              f't_svd_s to the qc_metadata CSV; needs 0 <= K < 3*nelem [0]')
+ 
++  parser.add_argument("-hhl_spectrum", dest='hhl_spectrum', type=str,
++        choices=list(math_tools.HHL_SPECTRUM_CHOICES),
++        default=math_tools.HHL_SPECTRUM_DEFAULT,
++        help=f'HHL only: source of the spectral data that scales the system '
++             f'and sizes the circuit. internal: A is scaled by its spectral '
++             f'radius (full eig) and the HHL library computes kappa and the '
++             f'eigenvalue bounds of the encoded matrix itself (full SVD and '
++             f'eigendecomposition), the path as before. deflation: needs '
++             f'-hhl_deflate_k K >= 1; A\' is scaled by sigma_max and the '
++             f'library is given kappa = sigma_max / sigma_K and eigenvalue '
++             f'bounds (sigma_K / sigma_max, 1) from the pre-step SVD, so none '
++             f'of those run. Recorded as hhl_spectrum, with the values used, '
++             f'in the qc_metadata CSV and the metadata pickle '
++             f'[{math_tools.HHL_SPECTRUM_DEFAULT}]')
++
++  parser.add_argument("-hhl_spectral_diag", dest='hhl_spectral_diag',
++        type=str, choices=list(math_tools.HHL_SPECTRAL_DIAG_CHOICES),
++        default=math_tools.HHL_SPECTRAL_DIAG_DEFAULT,
++        help=f'HHL only: on computes the diagnostic qc_metadata columns '
++             f'condition_number and lambda_* (full dense cond and eigvals, '
++             f'outside every timing); off skips them (empty cells), valid '
++             f'with -hhl_spectrum deflation only '
++             f'[{math_tools.HHL_SPECTRAL_DIAG_DEFAULT}]')
++
+   parser.add_argument("-loadcirc", action='store_true', dest='load_qcirc',
+         help=f'flag to load circuits if available, False by default')
+ 
+@@ -241,6 +265,12 @@
+   if args.hhl_deflate_k and linear_solver != 'HHL':
+     parser.error(f"-hhl_deflate_k applies to -linsolver HHL only; got "
+                  f"-linsolver {linear_solver}")
++  # item 19: -hhl_spectrum / -hhl_spectral_diag are HHL-only too
++  if linear_solver != 'HHL' and (
++      args.hhl_spectrum != math_tools.HHL_SPECTRUM_DEFAULT
++      or args.hhl_spectral_diag != math_tools.HHL_SPECTRAL_DIAG_DEFAULT):
++    parser.error(f"-hhl_spectrum / -hhl_spectral_diag apply to -linsolver "
++                 f"HHL only; got -linsolver {linear_solver}")
+ 
+   if linear_solver == 'HHL':
+     linsolv_args['backend_type'] = backend_type
+@@ -258,6 +288,14 @@
+       parser.error(f"-hhl_deflate_k must satisfy 0 <= K < 3*nelem = "
+                    f"{3 * Nelem}; got {args.hhl_deflate_k}")
+     linsolv_args['hhl_deflate_k'] = args.hhl_deflate_k
++    # item 19: spectrum source and diagnostics, validated before any solve
++    try:
++      check_hhl_spectrum(args.hhl_spectrum, args.hhl_spectral_diag,
++                         args.hhl_deflate_k)
++    except ValueError as e:
++      parser.error(str(e))
++    linsolv_args['hhl_spectrum'] = args.hhl_spectrum
++    linsolv_args['hhl_spectral_diag'] = args.hhl_spectral_diag
+     if not (backend_type == 'ideal') and args.nshots == 0:
+       linsolv_args['shots'] = 128 #default for real backends
+       # keep the case name, the metadata pickle (nshots, effective_shots)
+@@ -476,6 +514,9 @@
+       metadata['hhl_scale'] = args.hhl_sol_scale
+       # item 6: the -hhl_deflate_k rank (0 = plain HHL)
+       metadata['hhl_deflate_k'] = args.hhl_deflate_k
++      # item 19: the spectrum source option and the diagnostics switch
++      metadata['hhl_spectrum'] = args.hhl_spectrum
++      metadata['hhl_spectral_diag'] = args.hhl_spectral_diag
+     if hasattr(time_solver, 'linsys_solver'):
+       qsolver = getattr(time_solver.linsys_solver, 'hhl_solver', None) \
+           or getattr(time_solver.linsys_solver, 'sqls_solver', None)
+--- a/quantum_tools.py
++++ b/quantum_tools.py
+@@ -17,10 +17,11 @@
+ 
+ from deflation import deflation_columns
+ from helper_tools import append_csv_row
++from hhl_spectrum import spectrum_columns
+ from math_tools import (convert_to_pow2, convert_system_to_herm,
+-  scale_Ab_by_spectral_radius, print_matrix_scientific,
++  scale_Ab, print_matrix_scientific,
+   get_verbosity, get_matrix_properties, resolve_sqls_k, deflate_suffix,
+-  CIRC_METRICS_CHOICES, CIRC_METRICS_DEFAULT)
++  spectrum_suffix, CIRC_METRICS_CHOICES, CIRC_METRICS_DEFAULT)
+ 
+ # Functions
+ #------------------------
+@@ -342,7 +343,8 @@
+       backend_method='statevector', nshots=0, verbosity=2, load_circ=False,
+       use_gpu=False, output_dir='.', steady_mode=False,
+       ibm_token=None, iqm_server_url=None, iqm_auth_server_url=None,
+-      seed=None, circ_metrics=CIRC_METRICS_DEFAULT, *args, **kwargs):
++      seed=None, circ_metrics=CIRC_METRICS_DEFAULT, spectral_diag=True,
++      *args, **kwargs):
+     """
+     Initialize QuantumHHL solver with various backend options.
+ 
+@@ -375,6 +377,11 @@
+         'u3cx-once' counts step 0 only and reuses it while the circuit
+         keeps its (qubits, instruction count) (fixed_basis_metrics);
+         'none' skips it.
++    spectral_diag : bool
++        True (default): compute the diagnostic condition_number and
++        lambda_* qc_metadata columns (full dense cond / eigvals of the
++        system matrix and of the scaled one). False (-hhl_spectral_diag
++        off): skip them, the cells are empty.
+     """
+     self.nshots = nshots
+     self.seed = seed
+@@ -382,6 +389,7 @@
+       raise ValueError(f"circ_metrics must be one of {CIRC_METRICS_CHOICES}"
+                        f"; got {circ_metrics!r}")
+     self.circ_metrics = circ_metrics
++    self.spectral_diag = bool(spectral_diag)
+     if verbosity is None:
+       self.verbosity = get_verbosity()
+     else:
+@@ -401,6 +409,12 @@
+     # -circ_metrics u3cx-once: ((num_qubits, instruction count), fb dict)
+     # of the counted generated circuit (fixed_basis_metrics)
+     self._fb_cache = None
++    # item 19: spectrum record of the last generated or loaded circuit
++    # ({'source', 'kappa', 'lambda_min', 'lambda_max', 'library_source'},
++    # None for a loaded circuit saved without one) and the library's wall
++    # seconds for its bounds in this step (0.0 when supplied or loaded)
++    self.circ_spectrum = None
++    self.t_library_spectrum_s = 0.0
+ 
+     import os
+     if not os.path.exists(self.output_dir):
+@@ -496,19 +510,22 @@
+       raise ValueError(f"Unknown backend_type: {self.backend_type}. "
+                       f"Must be one of: 'ideal', 'fake', 'real-ibm', 'real-iqm'")
+ 
+-  def qpy_path(self, kind, nelem, step, iter, deflate_k=0):
++  def qpy_path(self, kind, nelem, step, iter, deflate_k=0,
++               hhl_spectrum='internal'):
+     """Path of a saved circuit, the one builder for generate_circuit
+     ('generated') and transpile_circuit ('transpile'):
+     <outdir>/circuit_<kind>_<method>[_shots<n>, transpile only]_nelem<n>
+-    _iter<step>[_deflate<k>].qpy in steady mode, _step<step>_iter<iter>
+-    otherwise (math_tools.deflate_suffix for the item-6 key)."""
++    _iter<step>[_deflate<k>][_spec<source>].qpy in steady mode,
++    _step<step>_iter<iter> otherwise (math_tools.deflate_suffix for the
++    item-6 key, spectrum_suffix for the item-19 one)."""
+     name = f'circuit_{kind}_{self.backend_method}'
+     if kind == 'transpile' and self.nshots:
+       name += f'_shots{self.nshots}'
+     name += f'_nelem{int(nelem)}'
+     name += f'_iter{step}' if self.steady_mode else f'_step{step}_iter{iter}'
+     return os.path.join(self.output_dir,
+-                        f'{name}{deflate_suffix(deflate_k)}.qpy')
++                        f'{name}{deflate_suffix(deflate_k)}'
++                        f'{spectrum_suffix(hhl_spectrum)}.qpy')
+ 
+   def fixed_basis_metrics(self, circ):
+     """circuit_metrics(circ, self.circ_metrics) with the reuse policy.
+@@ -538,9 +555,16 @@
+     return fb
+ 
+   def generate_circuit(self, A_herm, b_herm, nelem=3, step=0, iter=0,
+-                       deflate_k=0):
++                       deflate_k=0, spectrum=None):
++    """Build (or with -loadcirc load) the HHL circuit of A_herm, b_herm.
++    spectrum None: the library computes kappa and the eigenvalue bounds of
++    A_herm itself (full SVD and eigendecomposition). An EncodedSpectrum
++    (hhl_spectrum.py) supplies them, so neither runs. Either way the
++    values used go to self.circ_spectrum and into the circuit's metadata,
++    which the qpy file keeps for a later -loadcirc."""
+     import os
+-    fname = self.qpy_path('generated', nelem, step, iter, deflate_k)
++    label = 'internal' if spectrum is None else spectrum.source
++    fname = self.qpy_path('generated', nelem, step, iter, deflate_k, label)
+ 
+     if self.load_circ and deflate_k and not os.path.exists(fname):
+       # a k = 0 circuit must never be reused for A': refuse rather than
+@@ -559,6 +583,9 @@
+       with open(fname, 'rb') as fd:
+         circ = qpy.load(fd)[0]
+       t_circ = time.time() - t
++      # the spectrum record saved with the circuit (None before item 19)
++      self.circ_spectrum = (circ.metadata or {}).get('hhl_spectrum')
++      self.t_library_spectrum_s = 0.0
+       if self.verbosity:
+         print(f'Loaded from {fname}'
+               f',  Time elapsed: {int(t_circ/60)} min {t_circ%60:.2f} sec')
+@@ -568,9 +595,29 @@
+ 
+     if self.verbosity:
+       print("\n"+"="*35+" Generating HHL circuit "+"="*35, flush=True)
++    supplied = {}
++    if spectrum is not None:
++      supplied = {'condition_bound': spectrum.kappa,
++                  'eigenvalue_bounds': (spectrum.lambda_min,
++                                        spectrum.lambda_max)}
+     t = time.time()
+-    circ = self.hhl.construct_circuit(A_herm, b_herm)
++    circ = self.hhl.construct_circuit(A_herm, b_herm, **supplied)
+     t_circ = time.time() - t
++    info = self.hhl.spectral_info
++    expected = 'internal' if spectrum is None else 'supplied'
++    if info is None or info.source != expected:
++      raise RuntimeError(f'HHL library spectrum source '
++                         f'{getattr(info, "source", None)!r}, expected '
++                         f'{expected!r}: the installed linear_solvers does '
++                         f'not honour the item-19 spectrum arguments')
++    # wall seconds of the library's own bound calls, a part of t_circ
++    self.t_library_spectrum_s = float(info.wall_s)
++    self.circ_spectrum = {'source': label, 'kappa': info.kappa,
++                          'lambda_min': info.lambda_min,
++                          'lambda_max': info.lambda_max,
++                          'library_source': info.source}
++    circ.metadata = dict(circ.metadata or {},
++                         hhl_spectrum=self.circ_spectrum)
+     if self.verbosity:
+       print(f'Time elapsed for generating HHL circuit: '
+             f'{int(t_circ/60)} min {t_circ%60:.2f} sec')
+@@ -591,7 +638,8 @@
+     return circ, t_circ
+   
+   def transpile_circuit(self, circ, nelem=3,
+-                        step=0, iter=0, optimization_level=2, deflate_k=0):
++                        step=0, iter=0, optimization_level=2, deflate_k=0,
++                        hhl_spectrum='internal'):
+     """
+     Transpile circuit for target backend with optimization.
+ 
+@@ -611,7 +659,8 @@
+         3: Heaviest optimization (slowest transpile, fastest circuit)
+     """
+     import os
+-    fname = self.qpy_path('transpile', nelem, step, iter, deflate_k)
++    fname = self.qpy_path('transpile', nelem, step, iter, deflate_k,
++                          hhl_spectrum)
+ 
+     if os.path.exists(fname) and self.load_circ:
+       if self.verbosity:
+@@ -778,30 +827,46 @@
+     return exact_vector*true_sol_norm/(np.linalg.norm(exact_vector) + 1e-15)
+ 
+   def solve_one_step(self, A_o, b_o, nelem=1, iter=0,
+-                      true_sol_norm=1., step=0, deflation=None):
++                      true_sol_norm=1., step=0, deflation=None,
++                      spectrum=None, a_scale=None):
+     """One HHL solve of A_o x = b_o (A_o is the matrix the circuit is built
+     from: with item-6 deflation the caller passes A' and the Deflation
+     record, so the deflate_k / kappa / kappa_eff / n_clock /
+     x_share_classical / t_svd_s columns can be written and the ORIGINAL
+-    system archived; nothing in the circuit construction changes)."""
++    system archived; nothing in the circuit construction changes).
++    Item 19: a_scale None scales A_o by its spectral radius (full eig, the
++    path as before), a float by that value; spectrum None lets the HHL
++    library compute kappa and the eigenvalue bounds of the encoded matrix,
++    an hhl_spectrum.EncodedSpectrum supplies them (and its a_scale is the
++    scale, unless a_scale is given). -hhl_spectrum deflation passes the
++    spectrum only; a_scale alone is the reference of the equivalence test
++    (the internal bounds of the same encoded matrix)."""
++    if spectrum is not None and a_scale is None:
++      a_scale = spectrum.a_scale
++    if not self.spectral_diag and deflation is None:
++      # the k = 0 kappa column is the diagnostic condition number itself
++      raise ValueError('spectral_diag False needs a deflation record '
++                       '(-hhl_spectral_diag off needs -hhl_spectrum '
++                       'deflation)')
+     #-----------------------------------------
+     # Step (0) Prepare matrix:
+     #-----------------------------------------
+ 
+-    # Compute original matrix properties
++    # Compute original matrix properties: diagnostic (c), metadata only
++    # (full cond and eigvals); not in any timing, skipped by
++    # -hhl_spectral_diag off (empty cells)
+     #----------------------------------------
+-    matrix_props_orig = get_matrix_properties(A_o)
++    matrix_props_orig = self._matrix_properties(A_o)
+ 
+-    #Step (0-a) scale matrix (optional)
++    #Step (0-a) scale matrix: class (b), A_o / rho with rho the spectral
++    # radius (a full eig, timed into t_spectrum_s) or the supplied scale
+     #----------------------------------------
+-    #scaling that may help reduce determinant \
+-    # size/spectral radius scaled to 1 (optional)
+-    A, b, spectral_radius = scale_Ab_by_spectral_radius(
+-        A_o, b_o, verbosity=self.verbosity)
++    A, b, spectral_radius, t_rho_s = scale_Ab(
++        A_o, b_o, verbosity=self.verbosity, rho=a_scale)
+ 
+-    # Compute scaled matrix properties
++    # Compute scaled matrix properties: diagnostic (c), as above
+     #----------------------------------------
+-    matrix_props_scaled = get_matrix_properties(A) 
++    matrix_props_scaled = self._matrix_properties(A)
+ 
+     #Step (0-b) convert to power of 2 matrix
+     #-------------------------------------------
+@@ -816,15 +881,18 @@
+     #Step (1) Generate HHL circuit
+     #-----------------------------------------
+     deflate_k = 0 if deflation is None else int(deflation.k)
++    hhl_spectrum = 'internal' if spectrum is None else spectrum.source
+     circ, circ_gen_time = self.generate_circuit(A_herm, b_herm, nelem,
+                                             step=step, iter=iter,
+-                                            deflate_k=deflate_k)
++                                            deflate_k=deflate_k,
++                                            spectrum=spectrum)
+ 
+     #-----------------------------------------
+     #Step (2) Circuit Transpilation
+     #-----------------------------------------
+     circ_transpile, circ_transp_time = self.transpile_circuit(
+-        circ, nelem, step=step, iter=iter, deflate_k=deflate_k)
++        circ, nelem, step=step, iter=iter, deflate_k=deflate_k,
++        hhl_spectrum=hhl_spectrum)
+ 
+     #-------------------------------------------------------------
+     # Step (3) Run circuit and compute final hhl solution
+@@ -889,6 +957,15 @@
+       # item 6: smallest singular triplets deflated classically (0 = none)
+       'deflate_k': 0 if deflation is None else int(deflation.k),
+     }
++    # item 19: the spectrum that scaled the system and built the circuit
++    # (last step), the same values as the qc_metadata spectrum columns
++    spec_cols = spectrum_columns(
++        '' if self.circ_spectrum is None else self.circ_spectrum['source'],
++        spectral_radius, self.circ_spectrum,
++        t_rho_s + self.t_library_spectrum_s)
++    self.qc_metadata.update({k: spec_cols[k] for k in (
++        'hhl_spectrum', 'hhl_a_scale', 'hhl_kappa', 'hhl_lambda_min',
++        'hhl_lambda_max')})
+ 
+     # Collect numerical metadata for CSV tracking
+     qc_metadata_numerical = {
+@@ -935,6 +1012,11 @@
+     qc_metadata_numerical.update(deflation_columns(
+         deflation, matrix_props_orig['condition_number'],
+         circ.qregs[1].size))
++    # item 19: hhl_spectrum ('internal' | 'deflation', '' for a loaded
++    # circuit saved without a record), hhl_a_scale (the scale s of A_o),
++    # hhl_kappa / hhl_lambda_min / hhl_lambda_max (the values the circuit
++    # was built from) and t_spectrum_s (spectral radius + library bounds)
++    qc_metadata_numerical.update(spec_cols)
+     # item 11: circ_qubits, fb_* fixed-basis columns, effective_shots
+     # (= nshots: one run per solve) and seed, the same eight as SQLS
+     qc_metadata_numerical.update(fairness_columns(
+@@ -946,6 +1028,16 @@
+       self.save_metadata(qc_metadata_numerical, nelem)
+ 
+     return hhl_sol
++
++  def _matrix_properties(self, A):
++    """get_matrix_properties(A) (diagnostic (c): full cond and eigvals),
++    or with spectral_diag False only size and nnz_per_row, the spectral
++    entries '' (empty CSV cells)."""
++    if self.spectral_diag:
++      return get_matrix_properties(A)
++    return {'size': A.shape[0], 'condition_number': '',
++            'nnz_per_row': np.count_nonzero(A) / A.shape[0],
++            'lambda_max': '', 'lambda_min': ''}
+ 
+   def save_metadata(self, qc_metadata_numerical, nelem):
+     """Append the step's row to qc_metadata_nelem<n>_<method>[_shots<s>].csv
+--- a/tests/contract.py
++++ b/tests/contract.py
+@@ -16,7 +16,7 @@
+ # the one place the '_deflate<k>' qpy key is spelled (QuantumHHL.qpy_path
+ # uses the same function); importable here because tests/__init__.py puts
+ # the repo root on sys.path and math_tools needs numpy only
+-from math_tools import deflate_suffix
++from math_tools import deflate_suffix, spectrum_suffix
+ 
+ # CSV headers written by the solver, in file order.
+ RESULTS_COLUMNS = ['xp', 'rho', 'u', 'p', 'Mach']
+@@ -83,6 +83,34 @@
+     'deflate_k', 'kappa', 'kappa_eff', 'n_clock', 'x_share_classical',
+     't_svd_s',
+ ]
++# Item 19 (HHL only, after the deflation columns): hhl_spectrum is the
++# source of the spectral data that scaled the system and built the circuit,
++# 'internal' (fvm spectral radius + the library's own full SVD /
++# eigendecomposition of the encoded matrix) or 'deflation' (from the item-6
++# pre-step SVD, -hhl_spectrum deflation); '' only for a -loadcirc circuit
++# saved before item 19 (no record in the qpy metadata). hhl_a_scale = the
++# scale s, A_q / s before padding (float: the spectral radius of A_q, or
++# sigma_max under deflation). hhl_kappa, hhl_lambda_min, hhl_lambda_max =
++# the condition number and |eigenvalue| bounds of the encoded Hermitian
++# matrix the circuit was built from (floats; lambda_min after the library's
++# near-zero substitution; empty cells when unknown, as for hhl_spectrum
++# ''). t_spectrum_s = wall seconds of the step's spectral work for the
++# circuit: the spectral radius plus the library's bound calls (the latter
++# a part of circ_generate_time), 0.0 under deflation (its cost is in
++# t_svd_s) and for loaded circuits' library part. -hhl_spectral_diag off
++# leaves condition_number and the four lambda_* columns as empty cells.
++QC_METADATA_SPECTRUM_COLUMNS = [
++    'hhl_spectrum', 'hhl_a_scale', 'hhl_kappa', 'hhl_lambda_min',
++    'hhl_lambda_max', 't_spectrum_s',
++]
++QC_METADATA_DIAGNOSTIC_COLUMNS = [
++    'condition_number', 'lambda_max_orig', 'lambda_min_orig',
++    'lambda_max_scaled', 'lambda_min_scaled',
++]
++HHL_SPECTRUM_CHOICES = ('internal', 'deflation')
++HHL_SPECTRUM_DEFAULT = 'internal'
++HHL_SPECTRAL_DIAG_CHOICES = ('on', 'off')
++HHL_SPECTRAL_DIAG_DEFAULT = 'on'
+ QC_METADATA_HHL_COLUMNS = [
+     'step', 'iter', 'matrix_size_orig', 'matrix_size_pow2',
+     'matrix_size_herm', 'condition_number', 'nnz_per_row',
+@@ -91,7 +119,7 @@
+     'circ_qubits_orig', 'circ_depth_transpile', 'circ_gates_transpile',
+     'circ_qubits_transpile', 'circ_generate_time', 'circ_transpile_time',
+     'circ_run_time', *QC_METADATA_DEFLATION_COLUMNS,
+-    *QC_METADATA_FAIRNESS_COLUMNS,
++    *QC_METADATA_SPECTRUM_COLUMNS, *QC_METADATA_FAIRNESS_COLUMNS,
+ ]
+ QC_METADATA_SQLS_COLUMNS = [
+     'step', 'iter', 'matrix_size_orig', 'matrix_size_pow2',
+@@ -141,15 +169,22 @@
+ METADATA_KEYS_QUANTUM = ['backend_type', 'backend_method', 'nshots',
+                          'circ_metrics', 'seed', 'effective_shots',
+                          'quantum_circuit']
+-# HHL runs only: the -hhl_scale rule that produced dq_hhl (item 11f) and
+-# the -hhl_deflate_k rank (item 6, int, 0 = plain HHL).
+-METADATA_KEYS_HHL_ONLY = ['hhl_scale', 'hhl_deflate_k']
++# HHL runs only: the -hhl_scale rule that produced dq_hhl (item 11f), the
++# -hhl_deflate_k rank (item 6, int, 0 = plain HHL), and the item-19
++# options -hhl_spectrum ('internal' | 'deflation') and -hhl_spectral_diag
++# ('on' | 'off'), as strings.
++METADATA_KEYS_HHL_ONLY = ['hhl_scale', 'hhl_deflate_k', 'hhl_spectrum',
++                          'hhl_spectral_diag']
+ HHL_SCALE_TYPES = ('leastsq', 'true_sol')
+ HHL_SCALE_DEFAULT = 'leastsq'
+ HHL_DEFLATE_K_DEFAULT = 0
+-# quantum_circuit (HHL) also carries deflate_k (item 6), the same rank.
++# quantum_circuit (HHL) also carries deflate_k (item 6), the same rank, and
++# the last step's item-19 spectrum: hhl_spectrum, hhl_a_scale, hhl_kappa,
++# hhl_lambda_min, hhl_lambda_max (the qc_metadata columns of that row).
+ QUANTUM_CIRCUIT_KEYS = {
+-    'HHL': ['backend_type', 'backend_method', 'use_gpu', 'deflate_k'],
++    'HHL': ['backend_type', 'backend_method', 'use_gpu', 'deflate_k',
++            'hhl_spectrum', 'hhl_a_scale', 'hhl_kappa', 'hhl_lambda_min',
++            'hhl_lambda_max'],
+     'SQLS': ['backend_type', 'backend_method', 'use_gpu', 'method', 'k',
+              'state_prep', 'repeats'],
+ }
+@@ -179,11 +214,13 @@
+ def expected_files(nelem: int, linsolver: str, n_steps: int,
+                    backend_method: str = 'statevector', nshots: int = 0,
+                    sqls_method: str = 'full_svd',
+-                   deflate_k: int = 0) -> set[str]:
++                   deflate_k: int = 0,
++                   hhl_spectrum: str = 'internal') -> set[str]:
+     """Exact file set a steady-mode run of n_steps outer iterations writes.
+     HHL with -hhl_deflate_k K > 0 keys its qpy circuit files with
+-    '_deflate<K>' (the circuit of A' is not the circuit of A); every other
+-    name is unchanged."""
++    '_deflate<K>' (the circuit of A' is not the circuit of A), and
++    -hhl_spectrum deflation adds '_specdeflation' (A' is scaled by
++    sigma_max, not the spectral radius); every other name is unchanged."""
+     case = case_name(nelem, linsolver, backend_method, nshots)
+     files = {f'metadata_{case}.pkl', f'final_results_{case}.csv',
+              f'residual_{case}.csv', f'solution_plot_{case}.png'}
+@@ -198,7 +235,7 @@
+         files.add(f'system_Ab_nelem{nelem}_iter{n}.pkl')
+     if linsolver == 'HHL':
+         files.add(f'qc_metadata_nelem{nelem}_{backend_method}{shots}.csv')
+-        sfx = deflate_suffix(deflate_k)
++        sfx = deflate_suffix(deflate_k) + spectrum_suffix(hhl_spectrum)
+         for n in range(n_steps):
+             files.add(f'circuit_generated_{backend_method}'
+                       f'_nelem{nelem}_iter{n}{sfx}.qpy')
+--- a/time_solvers.py
++++ b/time_solvers.py
+@@ -8,10 +8,12 @@
+ 
+ from math_tools import (convert_to_pow2, convert_system_to_herm, \
+         extract_true_sol_from_herm, print_matrix_scientific,
+-        choose_global_sign)
++        choose_global_sign, HHL_SPECTRUM_CHOICES, HHL_SPECTRUM_DEFAULT,
++        HHL_SPECTRAL_DIAG_CHOICES, HHL_SPECTRAL_DIAG_DEFAULT)
+ 
+ from helper_tools import write_csv, append_csv_row
+ from deflation import deflate
++from hhl_spectrum import encoded_spectrum
+ 
+ # -hhl_scale choices (item 11f). 'leastsq' (the default, and what every
+ # April / August / current run executed: the old CLI default 'true_scale'
+@@ -22,6 +24,27 @@
+ # reference-free from ||A(+-x) - b||).
+ HHL_SCALE_TYPES = ('leastsq', 'true_sol')
+ HHL_SCALE_DEFAULT = 'leastsq'
++
++
++def check_hhl_spectrum(hhl_spectrum: str, spectral_diag: str,
++                       deflate_k: int) -> None:
++  """Item-19 option rules, one place for the CLI and LinearSystemSolver:
++  -hhl_spectrum deflation needs -hhl_deflate_k >= 1 (the spectrum comes
++  from the pre-step SVD) and -hhl_spectral_diag off needs -hhl_spectrum
++  deflation (at k = 0 the kappa column is the diagnostic cond(A))."""
++  if hhl_spectrum not in HHL_SPECTRUM_CHOICES:
++    raise ValueError(f"hhl_spectrum must be one of {HHL_SPECTRUM_CHOICES}; "
++                     f"got {hhl_spectrum!r}")
++  if spectral_diag not in HHL_SPECTRAL_DIAG_CHOICES:
++    raise ValueError(f"hhl_spectral_diag must be one of "
++                     f"{HHL_SPECTRAL_DIAG_CHOICES}; got {spectral_diag!r}")
++  if hhl_spectrum == 'deflation' and int(deflate_k) < 1:
++    raise ValueError(f"-hhl_spectrum deflation takes the spectrum from the "
++                     f"deflation pre-step and needs -hhl_deflate_k >= 1; got "
++                     f"-hhl_deflate_k {int(deflate_k)}")
++  if spectral_diag == 'off' and hhl_spectrum != 'deflation':
++    raise ValueError(f"-hhl_spectral_diag off needs -hhl_spectrum "
++                     f"deflation; got -hhl_spectrum {hhl_spectrum}")
+ 
+ 
+ class TimeSolver:
+@@ -289,6 +312,14 @@
+         if self.hhl_deflate_k < 0:
+           raise ValueError(f"hhl_deflate_k must be >= 0; got "
+                            f"{self.hhl_deflate_k}")
++        # item 19: -hhl_spectrum (where the HHL scale and circuit bounds
++        # come from) and -hhl_spectral_diag (the diagnostic columns)
++        self.hhl_spectrum = linsolv_args.get('hhl_spectrum',
++                                             HHL_SPECTRUM_DEFAULT)
++        self.hhl_spectral_diag = linsolv_args.get('hhl_spectral_diag',
++                                                  HHL_SPECTRAL_DIAG_DEFAULT)
++        check_hhl_spectrum(self.hhl_spectrum, self.hhl_spectral_diag,
++                           self.hhl_deflate_k)
+         ls_verbosity = linsolv_args['hhl_verbosity']
+         self.hhl_solver = QuantumHHL(backend_type=backend_type,
+                                      backend_method=backend_method,
+@@ -298,7 +329,9 @@
+                                      steady_mode=self.steady_mode,
+                                      seed=linsolv_args.get('seed'),
+                                      circ_metrics=linsolv_args.get(
+-                                         'circ_metrics', 'u3cx'))
++                                         'circ_metrics', 'u3cx'),
++                                     spectral_diag=(
++                                         self.hhl_spectral_diag == 'on'))
+       except ImportError as e:
+         # only a missing package leaves hhl_solver None; other errors
+         # propagate with their real message
+@@ -566,6 +599,14 @@
+     if self.hhl_deflate_k:
+       defl = deflate(A, b, self.hhl_deflate_k)
+       A_q = defl.a_shifted
++    # item 19 (hhl_spectrum.py): -hhl_spectrum deflation scales A' by
++    # sigma_max and supplies kappa = sigma_max / sigma_k, lambda bounds
++    # (sigma_k / sigma_max, 1) of the encoded matrix from the pre-step, so
++    # no eig of A' and no library SVD / eigendecomposition run; 'internal'
++    # (default) leaves both to the path as before
++    spectrum = None
++    if self.hhl_spectrum == 'deflation':
++      spectrum = encoded_spectrum(defl)
+ 
+     # classical Hermitian-system LU of the system HHL solves, computed on
+     # first use only: the true_sol norm and the shots-mode signs consume
+@@ -578,7 +619,8 @@
+     #---------------------------------------
+     nelem = int(A.shape[0]/3) #3 because nvariables = 3
+     dq_hhl = self.hhl_solver.solve_one_step(A_q, b, nelem, self.iter,
+-                                            step=step, deflation=defl)
++                                            step=step, deflation=defl,
++                                            spectrum=spectrum)
+     dq_hhl = extract_true_sol_from_herm(dq_hhl, nsys)
+ 
+     #correct sign and magnitude of HHL sol (of the system HHL solved, A_q)
+--- /dev/null
++++ b/hhl_spectrum.py
+@@ -0,0 +1,101 @@
++"""Spectral data of the matrix the HHL circuit encodes (work-plan item 19).
++
++The HHL path hands the library H, not A. With A_q the system matrix (A, or
++the item-6 shifted A' under -hhl_deflate_k K > 0) and s the scale:
++
++    A_s = A_q / s                         (math_tools.scale_Ab)
++    P   = [[A_s, 0], [0, I_p]]            (convert_to_pow2, p >= 0 pad rows)
++    H   = [[0, P], [P^H, 0]]              (convert_system_to_herm)
++
++H is Hermitian with eigenvalues +-sigma_i(P), so its |eigenvalues| are the
++singular values of P: sigma_i(A_q) / s and, when p > 0, p ones. (If P is
++already Hermitian it is not doubled; then |eig(P)| = sigma(P) as well,
++since a Hermitian matrix is normal.) The ones never set a bound when
++sigma_min(A_q) <= s <= sigma_max(A_q). Then
++
++    lambda_min(H) = sigma_min(A_q) / s,   lambda_max(H) = sigma_max(A_q) / s,
++    kappa(H)      = sigma_max(A_q) / sigma_min(A_q)   (s and p drop out).
++
++The default s is the spectral radius rho(A_q); sigma_min <= rho <= sigma_max
++holds for every matrix, so the identity covers the default path too.
++
++For A' the singular values are sigma_k .. sigma_{N-1} of A plus k copies of
++sigma_max (0-based ascending; sigma_k is the (k+1)-th smallest of A). The
++pre-step SVD already holds both ends, so -hhl_spectrum deflation takes
++s = sigma_max and supplies
++
++    kappa = sigma_max / sigma_k = kappa_eff,
++    lambda_min = sigma_k / sigma_max,   lambda_max = 1,
++
++with no eig of A' and no SVD or eigendecomposition of H. The default s =
++rho(A') would need a full eig of A', which the pre-step does not give.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from deflation import Deflation
++
++# qc_metadata columns (HHL, after the item-6 columns): the spectrum source
++# label, the scale s of A_q, the kappa and |eigenvalue| bounds the circuit
++# was built from, and the wall seconds of the spectral work for them.
++SPECTRUM_COLUMNS = ('hhl_spectrum', 'hhl_a_scale', 'hhl_kappa',
++                    'hhl_lambda_min', 'hhl_lambda_max', 't_spectrum_s')
++
++
++@dataclass(frozen=True)
++class EncodedSpectrum:
++    """Supplied spectral data: the scale of A_q and the bounds of H."""
++
++    source: str
++    a_scale: float
++    kappa: float
++    lambda_min: float
++    lambda_max: float
++
++
++def encoded_bounds(sigma_max: float, sigma_min: float,
++                   a_scale: float) -> tuple[float, float, float]:
++    """(kappa, lambda_min, lambda_max) of H from the extreme singular values
++    of A_q and the scale s (module docstring). Needs 0 < sigma_min <= s <=
++    sigma_max, so the padding block's unit singular values sit inside the
++    range."""
++    sigma_max, sigma_min = float(sigma_max), float(sigma_min)
++    a_scale = float(a_scale)
++    if not 0.0 < sigma_min <= a_scale <= sigma_max:
++        raise ValueError(f'need 0 < sigma_min <= scale <= sigma_max; got '
++                         f'{sigma_min}, {a_scale}, {sigma_max}')
++    return sigma_max / sigma_min, sigma_min / a_scale, sigma_max / a_scale
++
++
++def encoded_spectrum(defl: Deflation) -> EncodedSpectrum:
++    """The -hhl_spectrum deflation data from the item-6 pre-step: s =
++    sigma_max, kappa = kappa_eff = sigma_max / sigma_k, lambda_min =
++    sigma_k / sigma_max, lambda_max = 1."""
++    sigma_max = defl.shift
++    sigma_k = float(defl.sigma[defl.k])
++    _, lambda_min, lambda_max = encoded_bounds(sigma_max, sigma_k, sigma_max)
++    # kappa as the kappa_eff column spells it, so the two are equal exactly
++    return EncodedSpectrum(source='deflation', a_scale=sigma_max,
++                           kappa=defl.kappa_eff, lambda_min=lambda_min,
++                           lambda_max=lambda_max)
++
++
++def spectrum_columns(label: str, a_scale: float, record: dict | None,
++                     t_spectrum_s: float) -> dict:
++    """The six qc_metadata columns. label: 'internal' | 'deflation', or ''
++    for a -loadcirc circuit saved without a spectrum record. record: the
++    circuit's {'kappa', 'lambda_min', 'lambda_max'} (None: empty cells).
++    t_spectrum_s: wall seconds of this step's spectral work for the circuit
++    (the spectral radius and the library bounds; 0.0 when supplied)."""
++    rec = record or {}
++
++    def cell(key: str) -> float | str:
++        val = rec.get(key)
++        return '' if val is None else float(val)
++
++    return {'hhl_spectrum': label, 'hhl_a_scale': float(a_scale),
++            'hhl_kappa': cell('kappa'), 'hhl_lambda_min': cell('lambda_min'),
++            'hhl_lambda_max': cell('lambda_max'),
++            't_spectrum_s': float(t_spectrum_s)}
+--- /dev/null
++++ b/tests/test_hhl_spectrum.py
+@@ -0,0 +1,536 @@
++"""Item 19: supplied spectral data on the HHL path (hhl_spectrum.py, the
++fork's construct_circuit(condition_bound=, eigenvalue_bounds=)).
++
++(1) The transformation of the pre-step singular values to the bounds of
++the encoded matrix H (scale, pad, Hermitian-double) holds to 1e-10 against
++np.linalg.cond / eigvals of H on every archived Jacobian, k = 1 to 4, on a
++synthetic 8 x 8 system (no padding) and a 5 x 5 one (3 pad rows), and for
++the default spectral-radius scale. (2) Supplying exactly the internal
++values builds the identical circuit (quantum_tools.circuit_key) at nelem 2
++(k = 0 and 1) and on the archived nelem-5 iteration-0 Jacobian deflated
++at k = 1 (construction only), with the library's bound calls forbidden.
++(3) nelem 2, k = 1, -hhl_spectrum deflation: same clock register as the
++internal computation, solution equal to 1e-10 to both the internal bounds
++of the same encoded matrix and the default spectral-radius path; the
++fvm and fork code make no dense spectral call besides the pre-step SVD.
++(4) The CLI: columns, empty diagnostic cells, pickle keys, the record in
++the saved qpy circuits and its -loadcirc read-back, parse-time
++rejections.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++from unittest import mock
++
++import numpy as np
++import scipy.linalg
++import linear_solvers
++from linear_solvers.matrices.numpy_matrix import NumPyMatrix
++
++from tests import contract, helpers, test_deflation
++from tests.helpers import BASE_ARGS, TimedTestCase
++
++import hhl_spectrum
++import math_tools
++from deflation import deflate
++from hhl_spectrum import EncodedSpectrum, encoded_bounds, encoded_spectrum
++from quantum_tools import QuantumHHL, circuit_key
++
++RTOL = 1e-10
++EQUIV_TOL = 1e-10
++KS = (1, 2, 3, 4)
++HHL_SV_SPEC_NELEM2_ARGS = [*test_deflation.HHL_SV_DEFLATE1_NELEM2_ARGS,
++                           '-hhl_spectrum', 'deflation',
++                           '-hhl_spectral_diag', 'off']
++# dense spectral routines watched in the fvm and fork sources
++SPECTRAL_FUNCS = ('svd', 'cond', 'eig', 'eigvals', 'eigh', 'eigvalsh')
++FORK_DIR = os.path.dirname(os.path.abspath(linear_solvers.__file__))
++# fixed synthetic systems: 8 x 8 (a power of 2, no padding) and 5 x 5
++_RNG = np.random.default_rng(19)
++SYNTHETIC = {n: (np.eye(n) * 3.0 + _RNG.standard_normal((n, n)),
++                 _RNG.standard_normal(n)) for n in (8, 5)}
++
++
++def encode(a_q: np.ndarray, b_vec: np.ndarray,
++           rho: float | None = None) -> tuple[np.ndarray, np.ndarray, float]:
++    """H, b_H and the scale, through the solver's own functions.
++    convert_to_pow2 returns None for a size that is already a power of 2
++    (never an fvm size, 3 * nelem); that case is unpadded here."""
++    a_s, b_s, scale, _ = math_tools.scale_Ab(a_q, b_vec, verbosity=0,
++                                             rho=rho)
++    if math_tools.next_power_of_2(a_s.shape[0]) == a_s.shape[0]:
++        a_p, b_p = a_s, b_s
++    else:
++        a_p, b_p = math_tools.convert_to_pow2(a_s, b_s, verbosity=0)
++    a_h, b_h = math_tools.convert_system_to_herm(a_p, b_p, verbosity=0)
++    return a_h, b_h, scale
++
++
++def internal_bounds(a_herm: np.ndarray) -> tuple[float, float, float]:
++    """(kappa, lambda_min, lambda_max) as the fork computes them."""
++    mat = NumPyMatrix(a_herm)
++    lam_min, lam_max = mat.eigs_bounds()
++    return mat.condition_bounds()[1], lam_min, lam_max
++
++
++def clock_qubits(kappa: float, n_b: int) -> int:
++    """The fork's rule nl = max(nb + 1, ceil(log2(kappa + 1))) + 1."""
++    return max(n_b + 1, int(np.ceil(np.log2(kappa + 1)))) + 1
++
++
++class SpectralCallLog:
++    """Context manager recording dense spectral calls (numpy.linalg and
++    scipy.linalg) made directly from the fvm modules (repo root) or the
++    HHL fork: a list of (function, file name)."""
++
++    def __init__(self) -> None:
++        self.calls: list[tuple[str, str]] = []
++        self._patches = []
++
++    def _wrap(self, name: str, func):
++        def wrapper(*args, **kwargs):
++            path = sys._getframe(1).f_code.co_filename
++            if (os.path.dirname(path) == str(helpers.REPO)
++                    or path.startswith(FORK_DIR)):
++                self.calls.append((name, os.path.basename(path)))
++            return func(*args, **kwargs)
++        return wrapper
++
++    def __enter__(self) -> 'SpectralCallLog':
++        for mod in (np.linalg, scipy.linalg):
++            for name in SPECTRAL_FUNCS:
++                if hasattr(mod, name):
++                    patch = mock.patch.object(
++                        mod, name, self._wrap(name, getattr(mod, name)))
++                    patch.start()
++                    self._patches.append(patch)
++        return self
++
++    def __exit__(self, *exc) -> None:
++        for patch in reversed(self._patches):
++            patch.stop()
++
++
++def forbid_library_bounds():
++    """Patches making NumPyMatrix.condition_bounds / eigs_bounds raise."""
++    err = AssertionError('library spectral bound computed')
++    return (mock.patch.object(NumPyMatrix, 'condition_bounds',
++                              side_effect=err),
++            mock.patch.object(NumPyMatrix, 'eigs_bounds', side_effect=err))
++
++
++class TestEncodedSpectrumDerivation(TimedTestCase):
++    """sigma_max, sigma_k of A -> kappa and |eigenvalue| bounds of H."""
++
++    def check(self, a_q: np.ndarray, b_vec: np.ndarray,
++              expect: tuple[float, float, float], rho: float | None) -> None:
++        a_herm, _, _ = encode(a_q, b_vec, rho)
++        kappa, lam_min, lam_max = internal_bounds(a_herm)
++        np.testing.assert_allclose(expect, (kappa, lam_min, lam_max),
++                                   rtol=RTOL)
++        n_b = int(np.log2(a_herm.shape[0]))
++        self.assertEqual(clock_qubits(expect[0], n_b),
++                         clock_qubits(kappa, n_b))
++
++    def test_deflation_spectrum_on_archived_systems(self) -> None:
++        for system in helpers.ALL_SYSTEMS:
++            a_mat, b_vec = helpers.load_system(system)
++            for k in KS:
++                with self.subTest(system=system, k=k):
++                    d = deflate(a_mat, b_vec, k)
++                    spec = encoded_spectrum(d)
++                    self.assertEqual(spec.source, 'deflation')
++                    self.assertEqual(spec.a_scale, d.shift)
++                    self.assertEqual(spec.kappa, d.kappa_eff)
++                    self.assertEqual(spec.lambda_max, 1.0)
++                    self.assertAlmostEqual(spec.lambda_min,
++                                           1.0 / d.kappa_eff, delta=1e-15)
++                    self.check(d.a_shifted, b_vec, (spec.kappa,
++                               spec.lambda_min, spec.lambda_max),
++                               spec.a_scale)
++
++    def test_deflation_spectrum_synthetic(self) -> None:
++        for n, (a_mat, b_vec) in SYNTHETIC.items():
++            for k in (1, 2, 3):
++                with self.subTest(n=n, k=k):
++                    d = deflate(a_mat, b_vec, k)
++                    spec = encoded_spectrum(d)
++                    self.check(d.a_shifted, b_vec, (spec.kappa,
++                               spec.lambda_min, spec.lambda_max),
++                               spec.a_scale)
++
++    def test_default_scale_identity(self) -> None:
++        """The same identity with s = rho(A_q), the default path, k = 0
++        to 2: kappa(H) = sigma_max / sigma_min of A_q, bounds sigma / rho."""
++        systems = [helpers.load_system(s) for s in helpers.ALL_SYSTEMS]
++        systems += list(SYNTHETIC.values())
++        for i, (a_mat, b_vec) in enumerate(systems):
++            for k in (0, 1, 2):
++                with self.subTest(system=i, k=k):
++                    a_q = a_mat if k == 0 else deflate(a_mat, b_vec,
++                                                       k).a_shifted
++                    sig = np.linalg.svd(a_q, compute_uv=False)
++                    _, _, rho = encode(a_q, b_vec)
++                    self.check(a_q, b_vec, encoded_bounds(sig.max(),
++                               sig.min(), rho), None)
++
++    def test_scale_outside_range_rejected(self) -> None:
++        for scale in (0.5, 11.0):
++            with self.subTest(scale=scale), self.assertRaises(ValueError):
++                encoded_bounds(10.0, 1.0, scale)
++        with self.assertRaises(ValueError):
++            encoded_bounds(10.0, 0.0, 5.0)
++        self.assertEqual(encoded_bounds(10.0, 2.0, 10.0), (5.0, 0.2, 1.0))
++
++    def test_columns_and_choices_match_contract(self) -> None:
++        self.assertEqual(list(hhl_spectrum.SPECTRUM_COLUMNS),
++                         contract.QC_METADATA_SPECTRUM_COLUMNS)
++        self.assertEqual(math_tools.HHL_SPECTRUM_CHOICES,
++                         contract.HHL_SPECTRUM_CHOICES)
++        self.assertEqual(math_tools.HHL_SPECTRUM_DEFAULT,
++                         contract.HHL_SPECTRUM_DEFAULT)
++        self.assertEqual(math_tools.HHL_SPECTRAL_DIAG_CHOICES,
++                         contract.HHL_SPECTRAL_DIAG_CHOICES)
++        self.assertEqual(math_tools.HHL_SPECTRAL_DIAG_DEFAULT,
++                         contract.HHL_SPECTRAL_DIAG_DEFAULT)
++        self.assertEqual(math_tools.spectrum_suffix('internal'), '')
++        self.assertEqual(math_tools.spectrum_suffix('deflation'),
++                         '_specdeflation')
++        cols = hhl_spectrum.spectrum_columns('', 2.0, None, 0.0)
++        self.assertEqual(list(cols), contract.QC_METADATA_SPECTRUM_COLUMNS)
++        self.assertEqual([cols[c] for c in ('hhl_kappa', 'hhl_lambda_min',
++                                            'hhl_lambda_max')], ['', '', ''])
++
++
++class TestSuppliedExactValuesSameCircuit(TimedTestCase):
++    """QuantumHHL.generate_circuit with the exact internal bounds supplied
++    (library bound calls forbidden) gives the circuit_key of the internal
++    build. nelem 2: about 4 s per k; nelem 5 (k = 1): about 35 s."""
++
++    @classmethod
++    def setUpClass(cls) -> None:
++        cls.qh = helpers.quiet(QuantumHHL, backend_type='ideal',
++                               backend_method='statevector', nshots=0,
++                               verbosity=0,
++                               output_dir=str(helpers.new_outdir('spec_')))
++        cls.qh.savedata = False
++
++    def check(self, system: str, k: int) -> None:
++        a_mat, b_vec = helpers.load_system(system)
++        a_q = a_mat if k == 0 else deflate(a_mat, b_vec, k).a_shifted
++        a_herm, b_herm, scale = encode(a_q, b_vec)
++        kappa, lam_min, lam_max = internal_bounds(a_herm)
++        circ_int, _ = self.qh.generate_circuit(a_herm, b_herm)
++        rec_int = dict(self.qh.circ_spectrum)
++        spec = EncodedSpectrum('exact', scale, kappa, lam_min, lam_max)
++        no_cond, no_eigs = forbid_library_bounds()
++        with no_cond, no_eigs:
++            circ_sup, _ = self.qh.generate_circuit(a_herm, b_herm,
++                                                   spectrum=spec)
++        rec_sup = self.qh.circ_spectrum
++        key_int = circuit_key(circ_int)
++        self.assertRegex(key_int, r'^[0-9a-f]{64}$')
++        self.assertEqual(key_int, circuit_key(circ_sup))
++        self.assertEqual(circ_int.qregs[1].size, circ_sup.qregs[1].size)
++        self.assertEqual(rec_int['library_source'], 'internal')
++        self.assertEqual(rec_sup['library_source'], 'supplied')
++        for key in ('kappa', 'lambda_min', 'lambda_max'):
++            self.assertEqual(rec_int[key], rec_sup[key], key)
++        self.assertEqual(self.qh.t_library_spectrum_s, 0.0)
++        # the record travels in the circuit metadata (qpy keeps it)
++        self.assertEqual(circ_sup.metadata['hhl_spectrum'], rec_sup)
++
++    def test_nelem2_k0(self) -> None:
++        self.check(helpers.SYSTEM_NELEM2_ITER0, 0)
++
++    def test_nelem2_k1(self) -> None:
++        self.check(helpers.SYSTEM_NELEM2_ITER0, 1)
++
++    def test_nelem5_iter0_k1(self) -> None:
++        self.check(helpers.SYSTEM_NELEM5_ITER0, 1)
++
++
++class TestDeflationSpectrumSolveNelem2(TimedTestCase):
++    """hhl_solve on the archived nelem-2 system with -hhl_deflate_k 1:
++    internal (default), deflation with diagnostics off, and the reference
++    = the internal library bounds of the same encoded matrix (A' / sigma_max,
++    the spectrum dropped and its scale kept). About 5 s per solve."""
++
++    @classmethod
++    def setUpClass(cls) -> None:
++        cls.a_mat, cls.b_vec = helpers.load_system(helpers.SYSTEM_NELEM2_ITER0)
++        cls.runs = {}
++        cls.calls = {}
++        orig = QuantumHHL.solve_one_step
++
++        def same_matrix(self, *args, spectrum=None, **kwargs):
++            return orig(self, *args, a_scale=spectrum.a_scale, **kwargs)
++
++        for tag, extra in (('internal', {}),
++                           ('deflation', {'hhl_spectrum': 'deflation',
++                                          'hhl_spectral_diag': 'off'}),
++                           ('reference', {'hhl_spectrum': 'deflation'})):
++            solver = helpers.make_linsys_solver(2, 'HHL', hhl_deflate_k=1,
++                                                **extra)
++            with SpectralCallLog() as log:
++                if tag == 'reference':
++                    with mock.patch.object(QuantumHHL, 'solve_one_step',
++                                           same_matrix):
++                        dq, _ = helpers.quiet(solver.hhl_solve, cls.a_mat,
++                                              cls.b_vec, step=0)
++                else:
++                    dq, _ = helpers.quiet(solver.hhl_solve, cls.a_mat,
++                                          cls.b_vec, step=0)
++            qc = helpers.read_csv(helpers.find_one(
++                Path(solver.hhl_solver.output_dir), 'qc_metadata_*.csv'))
++            cls.runs[tag] = (dq, qc, solver.hhl_solver.qc_metadata)
++            cls.calls[tag] = log.calls
++
++    def test_clock_register_equals_internal(self) -> None:
++        n_clock = {t: r[1]['n_clock'][0] for t, r in self.runs.items()}
++        self.assertEqual(n_clock['deflation'], n_clock['reference'])
++        self.assertEqual(n_clock['deflation'], n_clock['internal'])
++        self.assertEqual(n_clock['deflation'], 6)
++        qc_d, qc_r = self.runs['deflation'][1], self.runs['reference'][1]
++        np.testing.assert_array_equal(qc_d['circ_qubits'],
++                                      qc_r['circ_qubits'])
++
++    def test_solution_matches_internal(self) -> None:
++        dq_d = self.runs['deflation'][0]
++        for tag in ('reference', 'internal'):
++            with self.subTest(vs=tag):
++                err = np.abs(dq_d - self.runs[tag][0]).max()
++                self.assertLessEqual(err, EQUIV_TOL, err)
++
++    def test_recorded_spectrum(self) -> None:
++        d = deflate(self.a_mat, self.b_vec, 1)
++        qc_d = self.runs['deflation'][1]
++        self.assertEqual(qc_d['hhl_spectrum'], ['deflation'])
++        self.assertEqual(qc_d['hhl_a_scale'][0], d.shift)
++        self.assertEqual(qc_d['hhl_kappa'][0], d.kappa_eff)
++        self.assertEqual(qc_d['hhl_kappa'][0], qc_d['kappa_eff'][0])
++        self.assertEqual(qc_d['hhl_lambda_max'][0], 1.0)
++        self.assertAlmostEqual(qc_d['hhl_lambda_min'][0], 1 / d.kappa_eff,
++                               delta=1e-15)
++        self.assertEqual(qc_d['t_spectrum_s'][0], 0.0)
++        for col in contract.QC_METADATA_DIAGNOSTIC_COLUMNS:
++            self.assertEqual(qc_d[col], [''], col)
++        # internal: the library's own values for H = double(pad(A' / rho))
++        qc_i = self.runs['internal'][1]
++        self.assertEqual(qc_i['hhl_spectrum'], ['internal'])
++        np.testing.assert_allclose(qc_i['hhl_kappa'], qc_i['kappa_eff'],
++                                   rtol=RTOL)
++        np.testing.assert_allclose(qc_i['hhl_a_scale'],
++                                   qc_i['lambda_max_orig'], rtol=0)
++        self.assertGreater(qc_i['t_spectrum_s'][0], 0.0)
++        meta_d = self.runs['deflation'][2]
++        self.assertEqual(meta_d['hhl_spectrum'], 'deflation')
++        self.assertEqual(meta_d['hhl_kappa'], d.kappa_eff)
++
++    def test_no_dense_spectral_call_besides_prestep_svd(self) -> None:
++        self.assertEqual(self.calls['deflation'], [('svd', 'deflation.py')])
++        # the default path, for contrast: pre-step SVD, the diagnostic
++        # cond / eigvals (twice), the spectral-radius eig and the library's
++        # cond / eigvals of H
++        self.assertEqual(sorted(self.calls['internal']), sorted([
++            ('svd', 'deflation.py'),
++            ('cond', 'math_tools.py'), ('eigvals', 'math_tools.py'),
++            ('eig', 'math_tools.py'),
++            ('cond', 'math_tools.py'), ('eigvals', 'math_tools.py'),
++            ('cond', 'numpy_matrix.py'), ('eigvals', 'numpy_matrix.py')]))
++
++    def test_option_rules(self) -> None:
++        for kwargs, text in (
++                ({'hhl_spectrum': 'deflation'}, '-hhl_deflate_k >= 1'),
++                ({'hhl_spectral_diag': 'off'}, 'needs -hhl_spectrum'),
++                ({'hhl_spectrum': 'sqls'}, 'hhl_spectrum must be one of')):
++            with self.subTest(**kwargs):
++                with self.assertRaises(ValueError) as ctx:
++                    helpers.make_linsys_solver(2, 'HHL', **kwargs)
++                self.assertIn(text, str(ctx.exception))
++
++
++class TestHHLSpectrumNelem2CLI(TimedTestCase):
++    """One nelem-2 HHL step with -hhl_deflate_k 1 -hhl_spectrum deflation
++    -hhl_spectral_diag off (about 16 s), next to the cached internal k = 1
++    and k = 0 runs."""
++
++    @classmethod
++    def setUpClass(cls) -> None:
++        cls.spec = helpers.run_solver_cached(HHL_SV_SPEC_NELEM2_ARGS,
++                                             timeout_s=300.0)
++        cls.k1 = helpers.run_solver_cached(
++            test_deflation.HHL_SV_DEFLATE1_NELEM2_ARGS, timeout_s=300.0)
++        cls.k0 = helpers.run_solver_cached(helpers.HHL_SV_NELEM2_ARGS,
++                                           timeout_s=300.0)
++
++    def qc(self, run: helpers.SolverRun) -> dict:
++        return helpers.read_csv(helpers.find_one(run.outdir,
++                                                 'qc_metadata_*.csv'))
++
++    def test_file_set_and_columns(self) -> None:
++        self.assertEqual(set(self.spec.files), contract.expected_files(
++            2, 'HHL', 1, deflate_k=1, hhl_spectrum='deflation'))
++        self.assertIn('circuit_generated_statevector_nelem2_iter0_deflate1'
++                      '_specdeflation.qpy', self.spec.files)
++        path = helpers.find_one(self.spec.outdir, 'qc_metadata_*.csv')
++        self.assertEqual(helpers.csv_columns(path),
++                         contract.QC_METADATA_HHL_COLUMNS)
++
++    def test_spectrum_columns_vs_internal(self) -> None:
++        qc_s, qc_1, qc_0 = self.qc(self.spec), self.qc(self.k1), self.qc(
++            self.k0)
++        self.assertEqual(qc_s['hhl_spectrum'], ['deflation'])
++        self.assertEqual(qc_1['hhl_spectrum'], ['internal'])
++        self.assertEqual(qc_0['hhl_spectrum'], ['internal', 'internal'])
++        # same clock register and circuit width as the internal k = 1 run
++        np.testing.assert_array_equal(qc_s['n_clock'], qc_1['n_clock'])
++        np.testing.assert_array_equal(qc_s['circ_qubits'],
++                                      qc_1['circ_qubits'])
++        np.testing.assert_allclose(qc_s['hhl_kappa'], qc_1['hhl_kappa'],
++                                   rtol=RTOL)
++        np.testing.assert_array_equal(qc_s['hhl_kappa'], qc_s['kappa_eff'])
++        np.testing.assert_array_equal(qc_s['hhl_lambda_max'], 1.0)
++        np.testing.assert_array_equal(qc_s['t_spectrum_s'], 0.0)
++        for col in contract.QC_METADATA_DIAGNOSTIC_COLUMNS:
++            self.assertEqual(qc_s[col], [''], col)
++        # default k = 0: kappa of H is cond(A), the scale is rho(A), the
++        # bounds are sigma_min / rho and sigma_max / rho of A
++        np.testing.assert_allclose(qc_0['hhl_kappa'],
++                                   qc_0['condition_number'], rtol=RTOL)
++        np.testing.assert_array_equal(qc_0['hhl_a_scale'],
++                                      qc_0['lambda_max_orig'])
++        np.testing.assert_allclose(
++            qc_0['hhl_lambda_max'] / qc_0['hhl_lambda_min'],
++            qc_0['hhl_kappa'], rtol=RTOL)
++        sys0 = helpers.load_pickle(self.k0.outdir
++                                   / 'system_Ab_nelem2_iter0.pkl')
++        sig = np.linalg.svd(sys0['A'], compute_uv=False)
++        np.testing.assert_allclose(
++            [qc_0['hhl_lambda_min'][0], qc_0['hhl_lambda_max'][0]],
++            [sig.min() / qc_0['hhl_a_scale'][0],
++             sig.max() / qc_0['hhl_a_scale'][0]], rtol=RTOL)
++        self.assertTrue(np.all(qc_0['t_spectrum_s'] > 0.0))
++
++    def test_solution_matches_internal_k1(self) -> None:
++        dq_s = helpers.read_csv(helpers.find_one(
++            self.spec.outdir, 'dq_nelem2_iter0_statevector.csv'))
++        dq_1 = helpers.read_csv(helpers.find_one(
++            self.k1.outdir, 'dq_nelem2_iter0_statevector.csv'))
++        np.testing.assert_array_equal(dq_s['dq_lu'], dq_1['dq_lu'])
++        err = np.abs(dq_s['dq_hhl'] - dq_1['dq_hhl']).max()
++        self.assertLessEqual(err, EQUIV_TOL, err)
++
++    def test_metadata_pickle(self) -> None:
++        meta = helpers.load_pickle(helpers.find_one(self.spec.outdir,
++                                                    'metadata_*.pkl'))
++        meta0 = helpers.load_pickle(helpers.find_one(self.k0.outdir,
++                                                     'metadata_*.pkl'))
++        for key in contract.METADATA_KEYS_HHL_ONLY:
++            self.assertIn(key, meta)
++            self.assertIn(key, meta0)
++        self.assertEqual((meta['hhl_spectrum'], meta['hhl_spectral_diag']),
++                         ('deflation', 'off'))
++        self.assertEqual((meta0['hhl_spectrum'], meta0['hhl_spectral_diag']),
++                         (contract.HHL_SPECTRUM_DEFAULT,
++                          contract.HHL_SPECTRAL_DIAG_DEFAULT))
++        qcm, qcm0 = meta['quantum_circuit'], meta0['quantum_circuit']
++        self.assertEqual(set(qcm), set(contract.QUANTUM_CIRCUIT_KEYS['HHL']))
++        self.assertEqual(qcm['hhl_spectrum'], 'deflation')
++        self.assertEqual(qcm0['hhl_spectrum'], 'internal')
++        qc_s = self.qc(self.spec)
++        for key in ('hhl_a_scale', 'hhl_kappa', 'hhl_lambda_min',
++                    'hhl_lambda_max'):
++            self.assertEqual(qcm[key], qc_s[key][-1], key)
++
++    def test_qpy_files_carry_the_record(self) -> None:
++        """The saved circuits hold the spectrum record in their qpy
++        metadata (JSON in the file). A -loadcirc reload itself cannot be
++        run: qpy on qiskit 2.5.2 fails to rebuild ExactReciprocalGate, on
++        the default path too (pre-existing); the read-back is tested
++        in-process in TestLoadedCircuitRecord."""
++        for kind in ('generated', 'transpile'):
++            with self.subTest(kind=kind):
++                raw = (self.spec.outdir / f'circuit_{kind}_statevector_nelem2'
++                       f'_iter0_deflate1_specdeflation.qpy').read_bytes()
++                self.assertIn(b'hhl_spectrum', raw)
++                self.assertIn(b'deflation', raw)
++                self.assertIn(b'library_source', raw)
++
++
++class TestLoadedCircuitRecord(TimedTestCase):
++    """-loadcirc read-back of the spectrum record: generate_circuit with
++    load_circ on a saved file returns the record from the circuit metadata
++    and no library time (qpy.load is replaced by the generated circuit, see
++    TestHHLSpectrumNelem2CLI.test_qpy_files_carry_the_record). About 3 s."""
++
++    def test_record_from_loaded_metadata(self) -> None:
++        a_mat, b_vec = helpers.load_system(helpers.SYSTEM_NELEM2_ITER0)
++        d = deflate(a_mat, b_vec, 1)
++        spec = encoded_spectrum(d)
++        a_herm, b_herm, _ = encode(d.a_shifted, b_vec, spec.a_scale)
++        qh = helpers.quiet(QuantumHHL, backend_type='ideal',
++                           backend_method='statevector', nshots=0,
++                           verbosity=0,
++                           output_dir=str(helpers.new_outdir('specload_')))
++        circ, _ = qh.generate_circuit(a_herm, b_herm, deflate_k=1,
++                                      spectrum=spec)
++        record = dict(qh.circ_spectrum)
++        fname = qh.qpy_path('generated', 3, 0, 0, 1, 'deflation')
++        self.assertTrue(fname.endswith('_deflate1_specdeflation.qpy'), fname)
++        self.assertTrue(os.path.exists(fname))
++        qh.load_circ = True
++        qh.circ_spectrum, qh.t_library_spectrum_s = None, 1.0
++        with mock.patch('quantum_tools.qpy.load', return_value=[circ]):
++            loaded, _ = qh.generate_circuit(a_herm, b_herm, deflate_k=1,
++                                            spectrum=spec)
++        self.assertIs(loaded, circ)
++        self.assertEqual(qh.circ_spectrum, record)
++        self.assertEqual(qh.t_library_spectrum_s, 0.0)
++        # a circuit saved before item 19 has no record: empty cells
++        circ.metadata = {}
++        with mock.patch('quantum_tools.qpy.load', return_value=[circ]):
++            qh.generate_circuit(a_herm, b_herm, deflate_k=1, spectrum=spec)
++        self.assertIsNone(qh.circ_spectrum)
++        cols = hhl_spectrum.spectrum_columns('', spec.a_scale, None, 0.0)
++        self.assertEqual(cols['hhl_kappa'], '')
++
++
++class TestHHLSpectrumCLIValidation(TimedTestCase):
++    """Parse-time rejections (exit 2, nothing written)."""
++
++    def _rejected(self, extra: list[str], solver: str = 'HHL') -> str:
++        outdir = helpers.new_outdir('rejected_')
++        run = helpers.run_solver(['-nelem', '2', '-linsolver', solver,
++                                  '-iters', '1', *extra, *BASE_ARGS],
++                                 outdir=outdir, check=False)
++        self.assertEqual(run.returncode, 2, run.stderr)
++        self.assertEqual(list(outdir.iterdir()), [])
++        return run.stderr
++
++    def test_deflation_needs_rank(self) -> None:
++        for extra in (['-hhl_spectrum', 'deflation'],
++                      ['-hhl_spectrum', 'deflation', '-hhl_deflate_k', '0']):
++            with self.subTest(extra=extra):
++                err = self._rejected(extra)
++                self.assertIn('-hhl_spectrum deflation', err)
++                self.assertIn('-hhl_deflate_k >= 1', err)
++
++    def test_diag_off_needs_deflation(self) -> None:
++        err = self._rejected(['-hhl_spectral_diag', 'off',
++                              '-hhl_deflate_k', '1'])
++        self.assertIn('-hhl_spectral_diag off needs -hhl_spectrum deflation',
++                      err)
++
++    def test_hhl_only(self) -> None:
++        for solver in ('LU', 'SQLS'):
++            with self.subTest(solver=solver):
++                err = self._rejected(['-hhl_spectrum', 'deflation'], solver)
++                self.assertIn('HHL only', err)
++
++    def test_unknown_choice(self) -> None:
++        err = self._rejected(['-hhl_spectrum', 'sqls'])
++        self.assertIn('invalid choice', err)

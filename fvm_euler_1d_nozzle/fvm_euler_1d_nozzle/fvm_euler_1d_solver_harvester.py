@@ -398,6 +398,35 @@ def _deflation(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _str_or_none(val: Any) -> str | None:
+    """Stripped string of a CSV cell; None if absent or empty."""
+    text = str(val).strip() if val is not None else ""
+    return text or None
+
+
+def _deflation_svd(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Which SVD backend ran the deflation pre-step of one step, with its
+    tolerances, split timings and accuracy check (fvm item 18 columns).
+
+    None when the CSV predates the columns (SQLS, all runs before item 18).
+    Empty cells (k = 0, or values the numpy backend does not have) are None.
+    t_xshare_s is a classical sparse LU solve, kept out of t_svd_s.
+    """
+    if "hhl_deflate_svd" not in row:
+        return None
+    return {
+        "backend": _str_or_none(row.get("hhl_deflate_svd")),
+        "svd_tol": _float_or_none(row.get("svd_tol")),
+        "sigma_max_method": _str_or_none(row.get("sigma_max_method")),
+        "sigma_max_tol": _float_or_none(row.get("sigma_max_tol")),
+        "t_smallest_k_s": _float_or_none(row.get("t_smallest_k_s")),
+        "t_sigma_max_s": _float_or_none(row.get("t_sigma_max_s")),
+        "x_share_method": _str_or_none(row.get("x_share_method")),
+        "t_xshare_s": _float_or_none(row.get("t_xshare_s")),
+        "svd_residual": _float_or_none(row.get("svd_residual")),
+    }
+
+
 def _linear_system_deflation(
     qc_metadata: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -438,6 +467,105 @@ def _deflation_summary(
         "n_clock_first": defl[0]["n_clock"],
         "n_clock_last": defl[-1]["n_clock"],
         "n_steps": len(defl),
+        **_deflation_svd_summary(passes),
+    }
+
+
+def _deflation_svd_summary(passes: list[dict[str, Any]]) -> dict[str, Any]:
+    """SVD backend part of the deflation summary: backend and methods of the
+    last step, tolerances, medians of the split pre-step timings and of
+    t_svd_s (the whole pre-step), and the worst triplet residual. All None
+    when the item 18 columns are absent."""
+    keys = ("svd_backend", "sigma_max_method", "x_share_method", "svd_tol",
+            "sigma_max_tol", "median_t_svd_s", "median_t_smallest_k_s",
+            "median_t_sigma_max_s", "median_t_xshare_s", "max_svd_residual")
+    rows = [(p["deflation_svd"], p.get("deflation") or {}) for p in passes
+            if p.get("deflation_svd")
+            and ((p.get("deflation") or {}).get("deflate_k") or 0) > 0]
+    if not rows:
+        return dict.fromkeys(keys)
+
+    def med(vals: list[Any]) -> float | None:
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
+    svd = [r for r, _ in rows]
+    resid = [r["svd_residual"] for r in svd if r["svd_residual"] is not None]
+    last = svd[-1]
+    return {
+        "svd_backend": last["backend"],
+        "sigma_max_method": last["sigma_max_method"],
+        "x_share_method": last["x_share_method"],
+        "svd_tol": last["svd_tol"],
+        "sigma_max_tol": last["sigma_max_tol"],
+        "median_t_svd_s": med([d.get("t_svd_s") for _, d in rows]),
+        "median_t_smallest_k_s": med([r["t_smallest_k_s"] for r in svd]),
+        "median_t_sigma_max_s": med([r["t_sigma_max_s"] for r in svd]),
+        "median_t_xshare_s": med([r["t_xshare_s"] for r in svd]),
+        "max_svd_residual": max(resid) if resid else None,
+    }
+
+
+def _hhl_spectrum(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Spectral information the HHL circuit of one step was built with
+    (fvm item 19 columns). None when the CSV predates the columns (SQLS,
+    all runs before item 19).
+
+    source is 'internal' (the HHL library computed kappa and the eigenvalue
+    bounds itself, a full classical SVD and eigvals) or 'deflation' (taken
+    from the deflation pre-step). kappa and the lambda bounds are of the
+    encoded Hermitian matrix H. t_spectrum_s is reported only here and in
+    the summary, never added to circuit_timing_total_s: part of it already
+    sits inside circ_generate_time.
+    """
+    if "hhl_spectrum" not in row:
+        return None
+    source = str(row.get("hhl_spectrum", "")).strip() or None
+    return {
+        "source": source,
+        "a_scale": _float_or_none(row.get("hhl_a_scale")),
+        "kappa": _float_or_none(row.get("hhl_kappa")),
+        "lambda_min": _float_or_none(row.get("hhl_lambda_min")),
+        "lambda_max": _float_or_none(row.get("hhl_lambda_max")),
+        "t_spectrum_s": _float_or_none(row.get("t_spectrum_s")),
+    }
+
+
+def _spectrum_summary(
+    passes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Spectrum source(s), first / last / median kappa of H, and the
+    classical spectral times (pre-step SVD and library bound calls) summed
+    over steps. None when no step carries the item 19 columns."""
+    spec = [(p["step"], p["spectrum"]) for p in passes if p.get("spectrum")]
+    if not spec:
+        return None
+    defl = [p.get("deflation") or {} for p in passes if p.get("spectrum")]
+
+    def total(vals: list[Any]) -> float | None:
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals), 6) if vals else None
+
+    kappas = [s["kappa"] for _, s in spec if s["kappa"] is not None]
+    sources = sorted({s["source"] for _, s in spec if s["source"]})
+    return {
+        "source": sources[0] if len(sources) == 1 else (sources or None),
+        "kappa_first": spec[0][1]["kappa"],
+        "kappa_last": spec[-1][1]["kappa"],
+        "median_kappa": statistics.median(kappas) if kappas else None,
+        "lambda_min_first": spec[0][1]["lambda_min"],
+        "lambda_max_first": spec[0][1]["lambda_max"],
+        "t_spectrum_total_s": total([s["t_spectrum_s"] for _, s in spec]),
+        "t_svd_total_s": total([d.get("t_svd_s") for d in defl]),
+        # classical sparse LU solve for x_share (item 18 sqls backend); not
+        # part of t_svd_s
+        "t_xshare_total_s": total([
+            (p.get("deflation_svd") or {}).get("t_xshare_s")
+            for p in passes if p.get("spectrum")]),
+        "timing_note": ("classical spectral work, reported apart from "
+                        "circuit_timing_total_s; t_spectrum_s partly "
+                        "overlaps circ_generate_time"),
+        "n_steps": len(spec),
     }
 
 
@@ -607,9 +735,9 @@ def _build_artifacts_sqls(
     for row in qc_metadata:
         solve_time = float(row.get("solve_time", 0.0))
         total_solve += solve_time
-        cond = row.get("condition_number")
+        cond = _float_or_none(row.get("condition_number"))
         if cond is not None:
-            condition_numbers.append(float(cond))
+            condition_numbers.append(cond)
         n_data = _int_or_none(row.get("n_data_qubits"))
         m_anc = _int_or_none(row.get("m_ancilla"))
         width = n_data + (m_anc or 0) if n_data is not None else None
@@ -641,6 +769,7 @@ def _build_artifacts_sqls(
             },
             "fixed_basis": _fixed_basis(row),
             "deflation": _deflation(row),
+            "deflation_svd": _deflation_svd(row),
         })
 
     linear_system: dict[str, Any] = {}
@@ -696,9 +825,9 @@ def _build_artifacts(
         total_transpile += trans_time
         total_execute += run_time
 
-        cond = row.get("condition_number")
+        cond = _float_or_none(row.get("condition_number"))
         if cond is not None:
-            condition_numbers.append(float(cond))
+            condition_numbers.append(cond)
 
         pass_entry: dict[str, Any] = {
             "step": step,
@@ -719,6 +848,8 @@ def _build_artifacts(
             },
             "fixed_basis": _fixed_basis(row),
             "deflation": _deflation(row),
+            "deflation_svd": _deflation_svd(row),
+            "spectrum": _hhl_spectrum(row),
         }
         transpile_passes.append(pass_entry)
 
@@ -741,6 +872,7 @@ def _build_artifacts(
     artifacts: dict[str, Any] = {
         "transpile_passes": transpile_passes,
         "fixed_basis_summary": _fixed_basis_summary(transpile_passes),
+        "spectrum_summary": _spectrum_summary(transpile_passes),
         "circuit_basis": HHL_BASIS,
         "circuit_timing_total_s": {
             "generate": round(total_generate, 6),
@@ -1013,6 +1145,15 @@ def generate_metadata(
                          else run_params.get("hhl_scale"))
     # HHL shifted-SVD deflation rank (fvm 8eb40832+; 0 = plain HHL)
     code["hhl_deflate_k"] = run_params.get("hhl_deflate_k")
+    # where the HHL spectrum came from (internal | deflation) and whether
+    # the diagnostic condition-number columns ran (on | off); fvm item 19+,
+    # null for SQLS and older runs
+    # and which SVD backend ran the deflation pre-step with its tolerance
+    # (numpy | sqls; fvm item 18+)
+    for key in ("hhl_spectrum", "hhl_spectral_diag", "hhl_deflate_svd",
+                "hhl_deflate_svd_tol"):
+        code[key] = (None if sqls_params is not None
+                     else run_params.get(key))
     for name in ("fvm", "sqls", "linear_solvers"):
         entry = (code_versions or {}).get(name)
         code[f"{name}_commit"] = (
