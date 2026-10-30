@@ -15,7 +15,7 @@
 #   q8020-sweep q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/fvm_nov2025_rerun.toml \
 #     --set _slurm=true --set _output_dir=/lustre/orion/ard189/proj-shared/q8020
 #
-# Check the exact case first (--groups exact): iter-0 transpiled gate count
+# Check the exact case first (group `exact`): iter-0 transpiled gate count
 # 689027, residual ~8.9e-11 after 7 iterations, system_Ab matching the original.
 
 [global]
@@ -24,7 +24,7 @@ _output_dir = "~/q8020"
 # --- Paths (override with --set for different layouts) ---
 _solver_dir = "./fvm_euler_1d_solver-a5317f2b"
 _harvester_dir = "./q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/fvm_euler_1d_nozzle"
-_postproc_venv = "./.venv"
+_postproc_venv = "./fvm_euler_1d_solver-a5317f2b/.venv"
 
 # --- SLURM (off by default; enable with --set _slurm=true) ---
 # Cases are single-core; pack 56 per node (71 cases -> 2 nodes).

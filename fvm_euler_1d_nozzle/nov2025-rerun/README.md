@@ -46,11 +46,11 @@ TOML=q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/fvm_nov2025_rer
 q8020-sweep $TOML --dry-run                     # expect 71 cases in 2 groups
 
 # Exact case first, to validate the stack (~70 min)
-q8020-sweep $TOML --groups exact --set _slurm=true \
+q8020-sweep $TOML exact --set _slurm=true \
     --set _output_dir=/lustre/orion/ard189/proj-shared/q8020
 
 # Then the shots ladder (70 cases packed on 2 nodes, up to ~2.6 h each)
-q8020-sweep $TOML --groups shots --set _slurm=true \
+q8020-sweep $TOML shots --set _slurm=true \
     --set _output_dir=/lustre/orion/ard189/proj-shared/q8020
 ```
 

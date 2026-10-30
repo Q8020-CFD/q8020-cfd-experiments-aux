@@ -1,0 +1,26 @@
+# Core dependencies (required for classical solvers)
+numpy>=2.2.6
+scipy>=1.15.3
+matplotlib>=3.10.7
+PyYAML>=6.0.3
+python-dotenv>=1.2.1
+
+# Quantum computing dependencies (required for HHL solver)
+# Dependencies from quantum_linear_solvers pyproject.toml
+# HHL library: Q8020-CFD fork @ 66eadf0, NOT the agallojr fork this file originally named.
+# Fingerprinted 2026-10-27: Q8020-CFD@66eadf0 reproduces April's iter-0 transpiled
+# gate counts exactly (649089 / 604520); agallojr@a0d54ca is always +56 (649145 / 604576).
+quantum_linear_solvers @ git+https://github.com/Q8020-CFD/quantum_linear_solvers@66eadf0b4edcff100b20edf70a99e79cc69c5923
+# frontier-qlsa (dropped: not imported by the solver; uninstallable at 6828eb91, depends on ../lwfm path) git+https://github.com/agallojr/frontier-qlsa@6828eb9197564886520affae10b90471f166bd4b
+qiskit>=2.2.3,<3.0
+qiskit-algorithms>=0.4.0
+qiskit-ibm-runtime>=0.43.1
+ddt>=1.7.2
+importlib-metadata>=8.7.0
+mapomatic>=0.14.0
+mthree>=3.0.0
+pylatexenc>=2.10
+
+# Additional quantum packages (for specific backends)
+qiskit-aer>=0.17.2
+qiskit-qasm3-import>=0.6.0
