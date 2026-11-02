@@ -22,3 +22,8 @@ qiskit-algorithms==0.3.1
 qiskit-ibm-runtime==0.35.0
 qiskit-qasm3-import==0.5.1
 qiskit-iqm==18.0
+
+# Transitive dep of qiskit-ibm-runtime (unused by the solver). uv can resolve
+# it to 0.55.2, which is sdist-only and fails to build with current setuptools
+# (no pkg_resources). 0.66.1 is what pip resolves and ships a py3 wheel.
+ibm-platform-services==0.66.1
