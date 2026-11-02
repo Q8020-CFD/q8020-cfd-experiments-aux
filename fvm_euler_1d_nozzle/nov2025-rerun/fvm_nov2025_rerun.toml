@@ -37,7 +37,7 @@ _slurm_walltime = "02:00:00"
 _slurm_exclusive_node = false
 _slurm_cores_per_task = 1
 _slurm_cores_per_node = 56
-_slurm_pack_venvs = ["${_solver_dir}/.venv", "${_postproc_venv}"]  # NVMe burst buffer
+_slurm_pack_venvs = ["${_solver_dir}/.venv"]  # NVMe burst buffer; also serves as _postproc_venv (list each venv once)
 
 # --- Solver command ---
 _script = """\
