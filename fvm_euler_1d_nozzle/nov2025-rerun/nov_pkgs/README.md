@@ -42,7 +42,7 @@ git -C fvm_euler_1d_solver worktree add ../fvm_euler_1d_solver-main origin/main
 #    Do NOT `uv sync` in the worktree: main's uv.lock installs qiskit 2.5.
 uv venv --python 3.10 fvm_euler_1d_solver-main/.venv
 uv pip install --python fvm_euler_1d_solver-main/.venv \
-    -r q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/requirements.nov2025.txt
+    -r q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/nov_pkgs/requirements.nov2025.txt
 
 # 4. Check versions (expect 3.10.x 2.2.6 1.15.3 1.2.4 0.15.1)
 fvm_euler_1d_solver-main/.venv/bin/python -c "
@@ -56,7 +56,7 @@ from your usual sweeper env.
 ## Run
 
 ```bash
-TOML=q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/fvm_main_novpkgs.toml
+TOML=q8020-cfd-experiments-aux/fvm_euler_1d_nozzle/nov2025-rerun/nov_pkgs/fvm_main_novpkgs.toml
 OUT=/lustre/orion/ard189/proj-shared/$USER/fvm-main-novpkgs
 
 # Dry run: expect 71 cases in 2 groups, #SBATCH -N 2, only /mnt/bb/.../venv_0
