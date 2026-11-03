@@ -2,9 +2,22 @@
 
 
 
-## Software Changes
+# Software Changes
 
-- ORNL SQLS repo URL is broken. Made a new repo in the q8020 org with the contents of a prior pull taken from ORNL on 2026-07-26. 
+SQLS
+=====
+
+- ORNL SQLS repo URL is broken. Made a new repo in the q8020 org with the contents of a prior pull taken from ORNL on 2026-07-26. Accessible to the members of the Q8020 org. 
+
+- Upgraded to Qiskit 2.6.0. 
+
+- Pad right hand side b with zero rather than 1e-8 to fix bug with shots. 
+
+- The sign of the solution is now chosen by comparing residuals.
+
+
+fvm_euler_1d_solver (& quantum_linear_solvers)
+=====
 
 - Added switches to fvm_euler_1d_solver to accept various SVD pre-step options, from SQLS, from numpy. 
 
@@ -16,10 +29,14 @@
 
 - Added test files to fvm_euler_1d_solver. Added switches to support SQLS. Fixed harness-level bugs.
 
+
+metautil
+=====
+
 - Harvester fixes - made need to reharvest (not rerun) April runs. 
 
 
-## Shots and Sign Handling
+# Shots and Sign Handling
 
 Current code handling:
 
