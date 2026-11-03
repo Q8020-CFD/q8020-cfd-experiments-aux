@@ -1,0 +1,82 @@
+# FVM Euler 1D nozzle, nelem 5: HHL at its defaults against QSVT at its best
+# shots settings, both with 150000 shots, one fixed seed, ideal backend.
+# Brief: pods/qsvt-hhl-shots-compare/brief.md (agallojr, 2026-11-03).
+# Code: fvm_euler_1d_solver 219907c (feature/sqls-aiaa-4q26-svd-deflation).
+#
+# Run from /Users/agallojr/proj/src/q8020 (the relative paths assume it),
+# one group per invocation, serially, cheapest first:
+#   q8020-sweep <this toml> --dry-run
+#   q8020-sweep <this toml> qsvt_best
+#   q8020-sweep <this toml> hhl_defaults
+# Plot: plot_qsvt_vs_hhl_shots.py beside this file reads the case dirs.
+#
+# Settings:
+# - common: nozzle steady Newton (BDF1, -localdt, -initers 1), CFL at the
+#   solver default (1e10; the -h text still says 1000), -iters 20,
+#   -circ_metrics at its default u3cx (per-step fixed-basis {u3,cx} counts).
+# - HHL: every solver option at its default (pad_eps 1e-8, sign-first off,
+#   hhl_scale leastsq, hhl_spectrum library). -v 2 is output only: it is the
+#   one path that records HHL's shot counts (the counts dict on stdout), from
+#   which the kept shots per step are read; it also adds a diagnostic exact
+#   statevector solve per step, which does not touch the update.
+# - QSVT: -qsvt_shots_sign_first on (signs of the LU solution before the
+#   magnitude fit, review finding F2) and -pad_eps 0 (an exact-zero pad keeps
+#   every postselected shot on the solution register, review finding F1);
+#   qsvt_eps 1e-3, max degree 20000 and angle solver fvm-fpi at defaults.
+# - _case_timeout is not honored by the sequential runner (subprocess_tee
+#   ignores it); the caps (QSVT 1800 s, HHL 3600 s) are enforced by the
+#   launching watchdog instead.
+
+[global]
+_output_dir = "~/q8020/fvm-qsvt-vs-hhl-shots"
+
+# --- Paths (relative to /Users/agallojr/proj/src/q8020) ---
+_solver_dir = "./fvm_euler_1d_solver"
+_metautil_dir = "./q8020-cfd-metautil"
+_experiment_dir = "./q8020-cfd-experiments"
+_postproc_venv = "./q8020-cfd-metautil/.venv"
+
+# --- Execution: local, one case at a time ---
+_slurm = false
+_run_mode = "sequential"
+
+# --- Solver command ---
+_script = """\
+source ${_solver_dir}/.venv/bin/activate && \
+python3 ${_solver_dir}/nozzle_1d_solver.py\
+"""
+_inject_outdir = "-outdir"
+
+# --- Common solver parameters ---
+"-nelem" = 5
+"-time_scheme" = "BDF1"
+"-localdt" = true
+"-initers" = 1
+"-iters" = 20
+"-shots" = 150000
+"-seed" = 1
+"-noshow" = true
+
+[global._env_exports]
+MPLBACKEND = "Agg"
+PYTHONDONTWRITEBYTECODE = "1"
+
+
+# QSVT, best documented shots settings at 219907c. The harvester knows HHL
+# and SQLS only, so this group has no _case_postproc (a list value, even
+# [], would be expanded as a sweep axis); the plot reads the run outputs.
+[qsvt_best]
+"-linsolver" = "QSVT"
+"-qsvt_shots_sign_first" = "on"
+"-pad_eps" = 0
+
+
+# HHL with every solver option at its default; -v 2 records the counts.
+# The fvm harvester postproc runs on this group only.
+[hhl_defaults]
+"-linsolver" = "HHL"
+"-v" = 2
+_case_postproc = """\
+source ${_postproc_venv}/bin/activate && \
+python3 ${_experiment_dir}/aux/fvm_euler_1d_nozzle/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py\
+"""
