@@ -9,7 +9,7 @@ fidelity, for exact statevector (shots 0) and 150000 shots. Built
 ## Source
 
 - Results: `results/fvm_euler_1d_solver/2026-11-07-hhl-nelem5-optlevel/` in
-  q8020-cfd-experiments (commit `301794c8`). It holds 16 cases:
+  q8020-cfd-experiments (commit `4d31eff9f`). It holds 16 cases:
   `<codebase>/shots<N>/opt<L>/`.
 - Excluded: `2026-11-07-hhl-nelem5-optlevel-run1-flag-noop/`. In that run the
   level flag did not reach the ideal-backend transpile call, so every case ran
