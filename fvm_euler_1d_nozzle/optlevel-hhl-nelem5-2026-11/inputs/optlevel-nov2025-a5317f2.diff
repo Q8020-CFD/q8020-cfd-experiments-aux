@@ -1,0 +1,61 @@
+diff --git a/nozzle_1d_solver.py b/nozzle_1d_solver.py
+index e9b667c6..4a095e95 100644
+--- a/nozzle_1d_solver.py
++++ b/nozzle_1d_solver.py
+@@ -114,7 +114,12 @@ if __name__ == '__main__':
+ 
+ 
+   #parsing inputs
++  parser.add_argument("-opt_level", dest='opt_level', type=int, default=2,
++                      choices=[0,1,2,3],
++                      help="Transpiler optimization level of the HHL circuit")
+   args = parser.parse_args()
++  import quantum_tools as _qt
++  _qt.HHL_OPT_LEVEL = args.opt_level
+   cfl = args.cfl
+   Nelem = args.nelem
+   xv = args.x_vec
+diff --git a/quantum_tools.py b/quantum_tools.py
+index 7e044c07..9d0a7ce0 100644
+--- a/quantum_tools.py
++++ b/quantum_tools.py
+@@ -152,6 +152,10 @@ def compate_state_exact_vs_counts_vecs(exact_vec, counts_vec):
+         f'{fidelity(counts_vec, exact_vec)}')
+   
+ 
++# Transpiler optimization level of the HHL transpile call (-opt_level).
++HHL_OPT_LEVEL = 2
++HHL_SEED_TRANSPILER = 1
++
+ class QuantumHHL:
+   def __init__(self, backend_type='ideal',
+       backend_method='statevector', nshots=0, verbosity=2, load_circ=False,
+@@ -341,7 +345,7 @@ class QuantumHHL:
+     return circ, t_circ
+   
+   def transpile_circuit(self, circ, nelem=3,
+-                        step=0, iter=0, optimization_level=2):
++                        step=0, iter=0, optimization_level=None):
+     """
+     Transpile circuit for target backend with optimization.
+ 
+@@ -360,6 +364,8 @@ class QuantumHHL:
+         2: Heavy optimization (slower transpile, faster circuit) - DEFAULT
+         3: Heaviest optimization (slowest transpile, fastest circuit)
+     """
++    if optimization_level is None:
++      optimization_level = HHL_OPT_LEVEL
+     import os
+     fname = f'circuit_transpile_{self.backend_method}'
+     if self.nshots:
+@@ -438,7 +444,9 @@ class QuantumHHL:
+       )
+     else:
+       # For ideal or IQM backends
+-      circ_transpile = transpile(circ, self.backend)
++      circ_transpile = transpile(circ, self.backend,
++                                 optimization_level=optimization_level,
++                                 seed_transpiler=HHL_SEED_TRANSPILER)
+ 
+     t_transpile = time.time() - t
+ 

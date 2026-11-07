@@ -1,0 +1,49 @@
+diff --git a/nozzle_1d_solver.py b/nozzle_1d_solver.py
+index a9db241d..6f04745c 100644
+--- a/nozzle_1d_solver.py
++++ b/nozzle_1d_solver.py
+@@ -229,7 +229,12 @@ if __name__ == '__main__':
+         help='original total max_iters from TOML (for chunked execution)')
+ 
+   #parsing inputs
++  parser.add_argument("-opt_level", dest='opt_level', type=int, default=2,
++                      choices=[0,1,2,3],
++                      help="Transpiler optimization level of the HHL circuit")
+   args = parser.parse_args()
++  import quantum_tools as _qt
++  _qt.HHL_OPT_LEVEL = args.opt_level
+ 
+   # Set global verbosity level
+   math_tools.set_verbosity(args.verbosity)
+diff --git a/quantum_tools.py b/quantum_tools.py
+index a39f56a8..ed9382be 100644
+--- a/quantum_tools.py
++++ b/quantum_tools.py
+@@ -294,6 +294,9 @@ def fairness_columns(circ_qubits, fb, effective_shots, seed):
+   }
+ 
+ 
++# Transpiler optimization level of the HHL transpile call (-opt_level).
++HHL_OPT_LEVEL = 2
++
+ class QuantumHHL:
+   def __init__(self, backend_type='ideal',
+       backend_method='statevector', nshots=0, verbosity=2, load_circ=False,
+@@ -574,7 +577,7 @@ class QuantumHHL:
+     return circ, t_circ
+   
+   def transpile_circuit(self, circ, nelem=3,
+-                        step=0, iter=0, optimization_level=2, deflate_k=0,
++                        step=0, iter=0, optimization_level=None, deflate_k=0,
+                         hhl_spectrum='internal'):
+     """
+     Transpile circuit for target backend with optimization.
+@@ -594,6 +597,8 @@ class QuantumHHL:
+         2: Heavy optimization (slower transpile, faster circuit) - DEFAULT
+         3: Heaviest optimization (slowest transpile, fastest circuit)
+     """
++    if optimization_level is None:
++      optimization_level = HHL_OPT_LEVEL
+     import os
+     fname = self.qpy_path('transpile', nelem, step, iter, deflate_k,
+                           hhl_spectrum)
