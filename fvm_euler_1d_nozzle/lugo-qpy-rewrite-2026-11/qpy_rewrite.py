@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from qiskit import QuantumCircuit, qpy
-from qiskit.circuit.library import UCRYGate
+from qiskit.circuit import library as qlib
+from qiskit.circuit.library import ExactReciprocalGate, UCRYGate
 from qiskit.quantum_info import Operator
 from qiskit.synthesis.unitary.qsd import qs_decomposition
 
@@ -55,9 +56,69 @@ class RewriteReport:
     notes: list = field(default_factory=list)
 
 
-def load_qpy(path: str) -> QuantumCircuit:
+def load_qpy(path: str,
+             recip: tuple[int, float, bool] | None = None) -> QuantumCircuit:
+    """Load a qpy circuit.
+
+    qiskit 2.x writes ExactReciprocalGate with no parameters, so neither
+    qpy.load nor the file knows its size, scaling or neg_vals and the load
+    fails with a TypeError (the nov26 LuGo generated circuit). With recip =
+    (nl, scaling, neg_vals) the gate is rebuilt as ExactReciprocalGate(nl,
+    scaling, neg_vals); the caller must supply values it can vouch for (see
+    recip_params and the checks in run_step0.py). Without recip the plain
+    loader is used, unchanged.
+    """
     with open(path, "rb") as fh:
-        return qpy.load(fh)[0]
+        if recip is None:
+            return qpy.load(fh)[0]
+        nl, scaling, neg_vals = recip
+
+        class Stub(ExactReciprocalGate):
+            def __init__(self, label: str = "1/x") -> None:
+                super().__init__(nl, scaling, neg_vals, label)
+
+        orig = qlib.ExactReciprocalGate
+        qlib.ExactReciprocalGate = Stub
+        try:
+            return qpy.load(fh)[0]
+        finally:
+            qlib.ExactReciprocalGate = orig
+
+
+def recip_angles(op) -> np.ndarray:
+    """Rotation angle on the ancilla for each state value c of a 1/x block
+    that is a uniformly controlled RY (state qubits first, ancilla last)."""
+    mat = Operator(op).data
+    h = 2 ** (op.num_qubits - 1)
+    return np.array([2 * np.arctan2(mat[c + h, c].real, mat[c, c].real)
+                     for c in range(h)])
+
+
+def recip_params(circ: QuantumCircuit) -> tuple[int, float, bool]:
+    """(nl, scaling, neg_vals) of a circuit's 1/x block that stores it as a
+    unitary, so that ExactReciprocalGate(nl, scaling, neg_vals) is equal to it.
+
+    Both sign conventions are tried. For neg_vals False the positive
+    rotation 2 arcsin(scaling 2^nl / c) runs over c = 1 .. 2^nl - 1; for True
+    it runs over c = 1 .. 2^(nl-1) - 1 and the upper half is the negative
+    branch. The scaling is read from the positive angles; a candidate is
+    accepted only if the rebuilt gate equals the stored block to 1e-9.
+    """
+    op = _top(circ, "1/x").operation
+    nl = op.num_qubits - 1
+    ang = recip_angles(op)
+    want = Operator(op).data
+    for neg in (False, True):
+        half = 2 ** nl >> int(neg)
+        c = np.arange(half)
+        ok = (c > 0) & (ang[:half] > 1e-9) & (ang[:half] < np.pi - 1e-6)
+        s = np.sin(ang[:half][ok] / 2) * c[ok] / half
+        if not len(s) or np.ptp(s) > 1e-9:
+            continue
+        gate = ExactReciprocalGate(nl, float(s.mean()), neg)
+        if np.max(np.abs(Operator(gate).data - want)) < 1e-9:
+            return nl, float(s.mean()), neg
+    raise ValueError("1/x is not an ExactReciprocal rotation")
 
 
 def _qidx(circ: QuantumCircuit, ins) -> list[int]:

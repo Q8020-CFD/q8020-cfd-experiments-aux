@@ -9,8 +9,13 @@ Sets (nozzle nelem 5 and 10, HHL with the LuGo QPE, Aer ideal simulator):
            on a macos-laptop with qiskit 2.6.0 / Aer 0.17.2 (run_step0.py)
   control  the feb26 step-0 qpy executed by run_step0.py as stored and
            re-transpiled, to show the pipeline reproduces the recorded run
+  rewrite_nov26, control_nov26_*
+           the same three, from the nov26 step-0 qpy (nelem 5 only; the
+           nov26 run kept no qpy at nelem 10), run with --source nov26
 
 Only step 0 can be compared like for like: the rewrite exists for step 0 only.
+The nov26 recorded rows take their hardware gate counts from the stored nov26
+transpiled qpy, the way the feb26 rows take theirs from the feb26 one.
 Full-run columns (Newton steps, final residual) are filled for feb26 and
 nov26 as context.
 
@@ -30,13 +35,23 @@ RES = EXP / "results/fvm_euler_1d_solver"
 REWRITE = RES / "2026-11-08-lugo-qpy-rewrite"
 RECORDED = {"feb26": RES / "2026-02-26-LuGo",
             "nov26": RES / "nov2025-rerun/LuGo-rerun"}
-QISKIT = {"feb26": "1.4.5", "nov26": "2.6", "rewrite": "2.6.0",
+QISKIT = {"feb26": "1.4.5", "nov26": "2.6.1 (qpy header)",
+          "rewrite": "2.6.0",
           "control_stored": "1.4.5 transpile, Aer 0.17.2 run",
-          "control_qiskit26": "2.6.0"}
+          "control_qiskit26": "2.6.0",
+          "rewrite_nov26": "2.6.0",
+          "control_nov26_stored": "2.6.1 transpile, Aer 0.17.2 run",
+          "control_nov26_qiskit26": "2.6.0"}
 WHERE = {"feb26": "Frontier", "nov26": "Frontier", "rewrite": "macos-laptop",
-         "control_stored": "macos-laptop", "control_qiskit26": "macos-laptop"}
+         "control_stored": "macos-laptop", "control_qiskit26": "macos-laptop",
+         "rewrite_nov26": "macos-laptop",
+         "control_nov26_stored": "macos-laptop",
+         "control_nov26_qiskit26": "macos-laptop"}
 VARIANT_SET = {"rewrite_qiskit26": "rewrite", "feb26_stored": "control_stored",
-               "feb26_qiskit26": "control_qiskit26"}
+               "feb26_qiskit26": "control_qiskit26",
+               "rewrite_nov26_qiskit26": "rewrite_nov26",
+               "nov26_stored": "control_nov26_stored",
+               "nov26_qiskit26": "control_nov26_qiskit26"}
 SHOTS = 150000
 NELEM = (5, 10)
 
@@ -118,15 +133,20 @@ def main() -> None:
     ap.add_argument("--nelem", type=int, nargs="+", default=list(NELEM))
     a = ap.parse_args()
     rdir = Path(a.res).expanduser()
-    circ = pd.concat([read(p) for p in rdir.glob("nelem*/circuits_*.csv")])
-    sv = pd.concat([read(p) for p in rdir.glob("nelem*/step0_statevector_*.csv")])
-    sh = pd.concat([read(p) for p in rdir.glob("nelem*/step0_shots_*.csv")])
+    def gather(name: str) -> pd.DataFrame:
+        """feb26 runs sit in nelem<N>/, nov26 runs in nov26-nelem<N>/."""
+        paths = [*rdir.glob(f"nelem*/{name}"), *rdir.glob(f"nov26-nelem*/{name}")]
+        return pd.concat([read(p) for p in paths])
+
+    circ = gather("circuits_*.csv")
+    sv = gather("step0_statevector_*.csv")
+    sh = gather("step0_shots_*.csv")
     rows, trials = [], []
     for nelem in a.nelem:
-        stored = circ[(circ.nelem == nelem) & (circ.variant == "feb26_stored")]
         for s in ("feb26", "nov26"):
             ex, tr = recorded(s, nelem)
-            c = stored.iloc[0].to_dict() if s == "feb26" and len(stored) else {}
+            stored = circ[(circ.nelem == nelem) & (circ.variant == f"{s}_stored")]
+            c = stored.iloc[0].to_dict() if len(stored) else {}
             c = {k: v for k, v in c.items() if k.startswith(("a2a", "heron"))}
             rows.append(summarize(s, nelem, ex, tr, c))
             trials += tr

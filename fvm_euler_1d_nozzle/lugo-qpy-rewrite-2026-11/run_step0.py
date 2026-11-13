@@ -1,11 +1,24 @@
-"""Step-0 runs of the Feb 2026 LuGo circuit: as stored, re-transpiled, rewritten.
+"""Step-0 runs of a LuGo circuit: as stored, re-transpiled, rewritten.
 
-Inputs are the 2026-02-26-LuGo qpy files only (step 0, per nelem). Variants:
+Inputs are the stored qpy files of one run (step 0, per nelem), chosen by
+--source: feb26 (the 2026-02-26 ORNL run, qiskit 1.4.5, the default) or nov26
+(the 2026-11-03 rerun, qiskit 2.6.1). Variants, for feb26:
 
   feb26_stored      the stored transpiled circuit (qiskit 1.4.5 transpile, Aer
                     target), executed here as is
   feb26_qiskit26    the stored generated circuit, transpiled here
   rewrite_qiskit26  the generated circuit after qpy_rewrite, transpiled here
+
+and for nov26 nov26_stored, nov26_qiskit26 and rewrite_nov26_qiskit26.
+
+The nov26 generated qpy holds an ExactReciprocalGate that qiskit 2.x writes
+without its size, scaling or neg_vals, so it cannot be loaded as is. It is
+loaded with (nl, scaling, neg_vals) taken from the feb26 generated qpy of the
+same nelem (infer_recip_angles.py derives them again from the nov26 stored
+run), after
+checking that the two circuits hold the same H*t and b; the load is then
+checked by running it against the nov26 stored transpiled circuit
+(state_fidelity_vs_<source>_stored in the statevector CSV).
 
 Transpiles here use this venv's qiskit at optimization level 2, seed 1:
 for the Aer statevector simulator (the executed circuit), and for gate
@@ -48,11 +61,25 @@ from qiskit.transpiler import generate_preset_pass_manager
 from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime.fake_provider import FakeMarrakesh
 
-from qpy_rewrite import load_qpy, rewrite
+from qpy_rewrite import load_qpy, recip_params, rewrite
 
 HERE = Path(__file__).resolve().parent
 EXP = HERE.parents[2]
-QPY_DIR = EXP / "results/fvm_euler_1d_solver/2026-02-26-LuGo/circuits"
+RES = EXP / "results/fvm_euler_1d_solver"
+FEB_DIR = RES / "2026-02-26-LuGo/circuits"
+NOV_DIR = RES / "nov2025-rerun/LuGo-rerun/circuits"
+SOURCES = {
+    "feb26": {"dir": FEB_DIR,
+              "gen": "circuit_generated_nelem{n}_iter0.qpy",
+              "stored": "circuit_transpile_nelem{n}_iter0.qpy",
+              "names": ("feb26_stored", "feb26_qiskit26", "rewrite_qiskit26")},
+    "nov26": {"dir": NOV_DIR,
+              "gen": "circuit_generated_statevector_nelem{n}_iter0.qpy",
+              "stored": "circuit_transpile_statevector_shots150000_nelem{n}"
+                        "_iter0.qpy",
+              "names": ("nov26_stored", "nov26_qiskit26",
+                        "rewrite_nov26_qiskit26")},
+}
 OPT, SEED_T = 2, 1
 
 
@@ -201,11 +228,37 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
-def run_nelem(nelem: int, seeds: list[int], shots: int, do_shots: bool,
-              heron: bool, log) -> tuple[list, list, list]:
+def load_inputs(source: str, nelem: int, log) -> tuple:
+    """(generated, stored, extra row fields) of one source and nelem."""
+    src = SOURCES[source]
+    extra: dict = {}
+    if source == "feb26":
+        gen = load_qpy(str(src["dir"] / src["gen"].format(n=nelem)))
+    else:
+        feb = load_qpy(str(FEB_DIR / SOURCES["feb26"]["gen"].format(n=nelem)))
+        nl, scaling, neg = recip_params(feb)
+        gen = load_qpy(str(src["dir"] / src["gen"].format(n=nelem)),
+                       recip=(nl, scaling, neg))
+        nbf = feb.num_qubits - nl - 1
+        ht_f, b_f = reference(feb, nbf)
+        ht_n, b_n = reference(gen, nbf)
+        extra = {"recip_nl": nl, "recip_scaling": scaling,
+                 "recip_neg_vals": neg,
+                 "ht_maxdiff_vs_feb26": float(np.max(np.abs(ht_n - ht_f))),
+                 "b_maxdiff_vs_feb26": float(np.max(np.abs(b_n - b_f)))}
+        log(f"nelem {nelem}: {source} generated loaded with nl={nl} "
+            f"scaling={scaling!r} neg_vals={neg} (from the feb26 1/x block); "
+            f"H*t, b vs "
+            f"feb26: {extra['ht_maxdiff_vs_feb26']:.2e}, "
+            f"{extra['b_maxdiff_vs_feb26']:.2e}")
+    stored = load_qpy(str(src["dir"] / src["stored"].format(n=nelem)))
+    return gen, stored, extra
+
+
+def run_nelem(source: str, nelem: int, seeds: list[int], shots: int,
+              do_shots: bool, heron: bool, log) -> tuple[list, list, list]:
     nsys = 3 * nelem
-    gen = load_qpy(str(QPY_DIR / f"circuit_generated_nelem{nelem}_iter0.qpy"))
-    stored = load_qpy(str(QPY_DIR / f"circuit_transpile_nelem{nelem}_iter0.qpy"))
+    gen, stored, extra = load_inputs(source, nelem, log)
     rw, rep = rewrite(gen)
     log(f"nelem {nelem}: {rep}")
     nb, n = rep.nb, gen.num_qubits
@@ -219,12 +272,13 @@ def run_nelem(nelem: int, seeds: list[int], shots: int, do_shots: bool,
     sim = AerSimulator(method="statevector")
     aer_pm = generate_preset_pass_manager(optimization_level=OPT, backend=sim,
                                           seed_transpiler=SEED_T)
-    variants = {"feb26_stored": (stored, False), "feb26_qiskit26": (gen, True),
-                "rewrite_qiskit26": (rw, True)}
+    n_st, n_q26, n_rw = SOURCES[source]["names"]
+    variants = {n_st: (stored, False), n_q26: (gen, True), n_rw: (rw, True)}
     circ_rows, sv_rows, shot_rows, svs = [], [], [], {}
     for name, (c, do_tr) in variants.items():
         row = {"nelem": nelem, "variant": name, "qubits": n,
-               "rewrite_s": rep.seconds if name.startswith("rewrite") else ""}
+               "rewrite_s": rep.seconds if name.startswith("rewrite") else "",
+               **extra}
         t0 = time.time()
         t_sv = aer_pm.run(strip_meas(c)) if do_tr else strip_meas(c)
         t_sh = aer_pm.run(with_meas(c)) if do_tr else with_meas(c)
@@ -256,15 +310,17 @@ def run_nelem(nelem: int, seeds: list[int], shots: int, do_shots: bool,
             row["shots_run_s_per_seed"] = (time.time() - t0) / len(seeds)
         circ_rows.append(row)
     for name, sv in svs.items():
-        f = abs(np.vdot(svs["feb26_stored"], sv)) ** 2
+        f = abs(np.vdot(svs[n_st], sv)) ** 2
         for r in sv_rows:
             if r["nelem"] == nelem and r["variant"] == name:
-                r["state_fidelity_vs_feb26_stored"] = float(f)
+                r[f"state_fidelity_vs_{n_st}"] = float(f)
     return circ_rows, sv_rows, shot_rows
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--source", choices=sorted(SOURCES), default="feb26",
+                    help="which stored LuGo run to take the qpy from")
     ap.add_argument("--nelem", type=int, nargs="+", default=[5])
     ap.add_argument("--shots-nelem", type=int, nargs="*", default=[5])
     ap.add_argument("--shots", type=int, default=150000)
@@ -295,7 +351,7 @@ def main() -> None:
     log(f"versions {versions}")
     allc, alls, allh = [], [], []
     for n in a.nelem:
-        c, s, h = run_nelem(n, seeds, a.shots, n in a.shots_nelem,
+        c, s, h = run_nelem(a.source, n, seeds, a.shots, n in a.shots_nelem,
                             not a.no_heron, log)
         allc += c
         alls += s
