@@ -176,6 +176,64 @@ and the file does not say what the gate was built with. The feb26 file holds
   take many minutes before any execution; it was left out to keep the runs
   short.
 
+### CX by part (added 2026-11-15)
+
+Where the saving comes from, feb26 step-0 generated qpy. Each part is
+transpiled on its own with qiskit 2.6.0, level 2, `seed_transpiler` 1, to the
+all-to-all `cx, rz, sx, x` basis (fvm repo venv, macos-laptop, about
+2026-11-15T05:05Z, 8.6 s for nelem 5 and 96 s for nelem 10). The parts sum
+to within 2 CX (original) and 46 to 52 CX (rewrite) of the whole-circuit
+counts above, which transpile across part boundaries.
+
+| part | nelem 5, LuGo | nelem 5, rewrite | nelem 10, LuGo | nelem 10, rewrite |
+|---|---|---|---|---|
+| controlled-U block, each | 3434 to 3436 | 1004 | 14433 to 14448 | 4140 |
+| all blocks (16 at nelem 5, 18 at nelem 10) | 54968 | 16064 | 259965 | 74520 |
+| 1/x | 2176 | 256 | 4352 | 512 |
+| QFT and H inside QPE, kept | 112 | 112 | 144 | 144 |
+| state preparation, kept | 26 | 26 | 57 | 57 |
+
+These feed Table 8 of the AIAA27 final paper
+(`overleaf/AIAA27-QCFD-final-paper/ag-custom-transpilation.tex`).
+
+### Heron against Nighthawk (added 2026-11-15)
+
+Does IBM Nighthawk's square lattice (`FakeNighthawk`, qiskit-ibm-runtime
+0.50.0: 120 qubits, 218 couplers, degree 4 at most, CZ) route the circuit
+shallower than Heron's heavy-hex (`FakeMarrakesh`: 156 qubits, 176 couplers,
+degree 3 at most, CZ)? Generated feb26 step-0 qpy, measurements stripped,
+qiskit 2.6.0, level 2, `seed_transpiler` 1 (plus 2 and 3 for the nelem 5
+rewrite), fvm repo venv, macos-laptop, about 2026-11-15T05:20Z (nelem 5) and
+2026-11-15T05:26:57Z to 05:29:01Z (nelem 10). Transpile only, nothing executed.
+`all-to-all CZ` uses the basis `cz, rz, sx, x` with no coupling map: the CZ
+floor with no routing.
+
+| nelem | circuit | target | 2q gates | 2q depth | depth |
+|---|---|---|---|---|---|
+| 5 | LuGo | all-to-all CZ | 57280 | 57179 | 225997 |
+| 5 | LuGo | Heron | 78993 | 73567 | 287084 |
+| 5 | LuGo | Nighthawk | 81818 | 73670 | 271971 |
+| 5 | rewrite | all-to-all CZ | 16412 | 15868 | 74842 |
+| 5 | rewrite | Heron, seeds 1 / 2 / 3 | 25915 / 26243 / 25598 | 23700 / 24201 / 23394 | 94178 / 96080 / 94470 |
+| 5 | rewrite | Nighthawk, seeds 1 / 2 / 3 | 26781 / 26676 / 26877 | 23910 / 23923 / 24142 | 91849 / 91841 / 92242 |
+| 10 | LuGo | Heron | 361770 | 339395 | 1329688 |
+| 10 | LuGo | Nighthawk | 378572 | 340524 | 1256973 |
+| 10 | rewrite | Heron | 113240 | 105315 | 433044 |
+| 10 | rewrite | Nighthawk | 124306 | 111889 | 426527 |
+
+- Nighthawk is only 1.5 % to 5.5 % shallower in total depth, and needs 3 %
+  to 10 % more CZ. Its two-qubit depth is the same or up to 6 % worse. The
+  denser coupling does not pay off for this circuit.
+- Most of the depth beyond all-to-all CX (48041 at nelem 5) is translation
+  to CZ (74842 with no routing), which both devices share. Routing adds
+  about 19300 on Heron and 17000 on Nighthawk.
+- FakeNighthawk warns that its error values are not typical for the device.
+  Level 2 layout is noise-aware, so its layout may differ from one made
+  with real calibration data. The topology is IBM's.
+- The rewrite's Heron numbers match the table above (25915, 433044). The
+  LuGo Heron depths here (287084, 1329688) are from the generated qpy; the
+  table's 287085 and 1329690 are from the stored transpiled qpy.
+
 ## Files
 
 | file | what it is |
