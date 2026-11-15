@@ -1,0 +1,165 @@
+% Transpiler optimization levels: qiskit 1.2.4 (nov2025 codebase) vs 2.6.0
+% (nov2026 codebase), for the fvm nozzle HHL circuit on the ideal Aer simulator.
+% Needs no packages beyond the LaTeX core; \input it into the body. In a
+% two-column class, change table to table*.
+%
+% Sources (q8020-cfd-experiments):
+%   Table 1: aux/fvm_euler_1d_nozzle/optlevel-hhl-nelem5-2026-11/qiskit-passes/
+%            passes_qiskit1.2.4.txt and passes_qiskit2.6.0.txt (dump_passes.py)
+%   Table 2: aux/fvm_euler_1d_nozzle/optlevel-hhl-nelem5-2026-11/
+%            compare-nov2025-nov2026/data/per_case.csv (step 0, shots 0)
+%   Runs:    results/fvm_euler_1d_solver/2026-11-07-hhl-nelem5-optlevel/
+%   Gate mix: results/fvm_euler_1d_solver/nov2025-rerun/nov_pkgs/2026-11-03/
+%            _9f0fbf67/719a35aa/circuit_transpile_statevector_nelem5_iter0.qpy
+
+\begin{table}[htbp]
+\centering
+\caption{Passes run at each preset optimization level by
+\texttt{transpile(circ, AerSimulator())}, qiskit 1.2.4 against 2.6.0. A
+bullet marks a pass or behaviour that the level uses. Layout and routing are
+empty at every level in both versions, because the simulator target has no
+coupling map; it accepts 98 operations natively. Bookkeeping passes are left
+out.}
+\label{tab:qiskit-optlevel-passes}
+\footnotesize
+\begin{tabular}{l|cccc|cccc}
+\hline
+ & \multicolumn{4}{c|}{qiskit 1.2.4} & \multicolumn{4}{c}{qiskit 2.6.0} \\
+Level & 0 & 1 & 2 & 3 & 0 & 1 & 2 & 3 \\
+\hline
+\multicolumn{9}{l}{\textit{Synthesis and translation}} \\
+\texttt{HighLevelSynthesis}, \texttt{BasisTranslator}
+  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$
+  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ \\
+\texttt{UnitarySynthesis}
+  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$
+  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ \\
+\hline
+\multicolumn{9}{l}{\textit{Removal and cancellation}} \\
+\texttt{ElidePermutations}
+  & & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ \\
+\texttt{RemoveDiagonalGatesBeforeMeasure}
+  & & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ \\
+\texttt{RemoveIdentityEquivalent}
+  & & & & & & & $\bullet$ & $\bullet$ \\
+\texttt{InverseCancellation}
+  & & $\bullet$ & $\bullet$ & $\bullet$ & & $\bullet$ & $\bullet$ & $\bullet$ \\
+\texttt{CommutativeCancellation}
+  & & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ \\
+\texttt{Optimize1qGatesDecomposition}
+  & & $\bullet$ & $\bullet$ & $\bullet$ & & $\bullet$ & $\bullet$ & $\bullet$ \\
+\hline
+\multicolumn{9}{l}{\textit{Two-qubit blocks}} \\
+\texttt{Collect2qBlocks}
+  & & & $\bullet$ & $\bullet$ & & & & \\
+\texttt{ConsolidateBlocks}$^{a}$
+  & & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ \\
+\texttt{Split2QUnitaries}
+  & & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ \\
+\texttt{TwoQubitPeepholeOptimization}
+  & & & & & & & $\bullet$ & $\bullet$ \\
+\hline
+\multicolumn{9}{l}{\textit{Control}} \\
+\texttt{ContractIdleWiresInControlFlow}$^{b}$
+  & & & & & & $\bullet$ & $\bullet$ & $\bullet$ \\
+Repeat until no change
+  & & $\bullet$ & $\bullet$ & & & $\bullet$ & $\bullet$ & \\
+Keep the best circuit found
+  & & & & $\bullet$ & & & & $\bullet$ \\
+Default when no level is given
+  & & $\bullet$ & & & & & $\bullet$ & \\
+\hline
+\end{tabular}
+
+\smallskip
+\begin{minipage}{0.92\linewidth}
+\footnotesize\raggedright
+$^{a}$In 2.6.0, \texttt{ConsolidateBlocks} collects its own blocks, and
+\texttt{TwoQubitPeepholeOptimization} takes over the two-qubit block
+resynthesis that 1.2.4 does with \texttt{Collect2qBlocks},
+\texttt{ConsolidateBlocks} and \texttt{UnitarySynthesis}.
+$^{b}$Acts only on control-flow operations; the HHL circuit has none.
+\end{minipage}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Transpiled HHL circuit for the 1D nozzle at 5 elements, Newton step 0
+(14 qubits, exact statevector run), by optimization level. The gate count
+includes all gate types. Transpile time is the mean over the 8 Newton steps
+of the run, in s, with 8 runs sharing a 12-core laptop.}
+\label{tab:qiskit-optlevel-hhl}
+\footnotesize
+\begin{tabular}{c|rrr|rrr|cc}
+\hline
+ & \multicolumn{3}{c|}{Depth} & \multicolumn{3}{c|}{Gates}
+ & \multicolumn{2}{c}{Transpile (s/step)} \\
+Level & 1.2.4 & 2.6.0 & change & 1.2.4 & 2.6.0 & change & 1.2.4 & 2.6.0 \\
+\hline
+0 & 689\,284 & 702\,509 & $+1.9\%$ & 689\,633 & 734\,779 & $+6.5\%$
+  & 19.6 & 0.68 \\
+1$^{*}$ & 689\,026 & 638\,248 & $-7.4\%$ & 689\,112 & 649\,091 & $-5.8\%$
+  & 17.6 & 1.5 \\
+2$^{\dagger}$ & 689\,026 & 596\,687 & $-13.4\%$ & 689\,112 & 641\,137
+  & $-7.0\%$ & 53.6 & 24.3 \\
+3 & 689\,026 & 596\,687 & $-13.4\%$ & 689\,112 & 641\,137 & $-7.0\%$
+  & 50.8 & 56.5 \\
+\hline
+\end{tabular}
+
+\smallskip
+\begin{minipage}{0.92\linewidth}
+\footnotesize\raggedright
+$^{*}$Default level on qiskit 1.2.4. $^{\dagger}$Default level on qiskit
+2.6.0. A replicate run gives transpile times up to about 1.5 times these. The
+two codebases also use different ports of the HHL circuit library (jw676
+\texttt{a94cf63} and Q8020 \texttt{99231b85}), so the table compares software
+stacks; the generated circuit has the same structure in both (5 layers, 19
+instructions).
+\end{minipage}
+\end{table}
+
+In both qiskit versions the four optimization levels share one structure
+(Table~\ref{tab:qiskit-optlevel-passes}). Level~0 only synthesizes the
+high-level HHL blocks (phase estimation, the reciprocal rotation and inverse
+phase estimation) and translates them into gates the target accepts. Level~1
+adds cancellation of inverse gate pairs and a loop that merges runs of
+single-qubit gates. Levels~2 and~3 add an init stage that also elides
+permutations, removes diagonal gates before measurement, applies
+commutation-aware cancellation and consolidates two-qubit blocks. They also
+resynthesize two-qubit blocks, once at level~2 and inside the loop at
+level~3. Level~3 then keeps the best circuit it has seen rather than the first
+fixed point. A simulator target needs no layout or routing, so the levels
+differ only in these passes.
+
+Three things change from qiskit 1.2.4 to 2.6.0. First, the default level rises
+from 1 to 2. Second, a single \texttt{TwoQubitPeepholeOptimization} pass
+replaces the collect, consolidate and resynthesize sequence. It keeps a
+resynthesized block only when the block has fewer two-qubit gates, then
+higher estimated fidelity, then fewer gates. Third, levels~2 and~3 gain
+\texttt{RemoveIdentityEquivalent}, which drops gates within tolerance of the
+identity.
+
+On qiskit 1.2.4, levels~1 to~3 return the same circuit, and level~0 is only
+258 layers deeper (Table~\ref{tab:qiskit-optlevel-hhl}). At the default level,
+99.8\% of the 689\,126 gates in the step-0 circuit are \texttt{cu},
+\texttt{ccx} and \texttt{cp} (346\,800, 226\,696 and 114\,296), which the
+simulator executes natively, and only 679 are single-qubit gates. This fits
+the higher levels finding nothing to remove: there is little single-qubit work
+to merge, and the three-qubit \texttt{ccx} gates break up the two-qubit
+blocks. On qiskit 2.6.0, each level up to~2 shortens the circuit: the depth
+goes from 702\,509 to 638\,248 to 596\,687. Level~3 gives the same step-0
+circuit as level~2 at 2.3 times the transpile time. At each version's default
+level, the depth falls by 13.4\%, from 689\,026 to 596\,687. Version~2.6.0 is
+also 11 to 29 times faster at levels~0 and~1, about 2 times faster at level~2
+and about as fast at level~3.
+
+On the noiseless simulator the level changes the cost, not the answer. The
+state fidelity of the HHL update against the classical solve agrees to six
+digits across all eight version and level combinations (mean 0.999815 over
+Newton steps 0 to 6), and the seeded 2.6.0 shot runs are bit-identical across
+levels. One caution applies to statevector extraction from the transpiled
+circuit. At levels~2 and~3, \texttt{ElidePermutations} and
+\texttt{RemoveDiagonalGatesBeforeMeasure} may change the state just before
+measurement without changing measurement statistics. They changed nothing
+here, but they run at the default level on 2.x and did not on 1.2.4.
