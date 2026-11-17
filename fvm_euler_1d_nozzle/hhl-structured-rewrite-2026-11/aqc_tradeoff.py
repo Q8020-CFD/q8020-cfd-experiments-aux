@@ -20,15 +20,14 @@ from qiskit.transpiler import generate_preset_pass_manager
 from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime.fake_provider import FakeNighthawk
 
-AUX = Path("/Users/agallojr/proj/src/q8020/q8020-cfd-experiments/aux/"
-           "fvm_euler_1d_nozzle/hhl-structured-rewrite-2026-11")
+AUX = Path(__file__).resolve().parent
+EXP = AUX.parents[2]  # q8020-cfd-experiments (aux checked out as submodule)
 sys.path.insert(0, str(AUX))
 import structured_rewrite as sr  # noqa: E402
 from run_step0 import extract_sv, reference, x_part  # noqa: E402
 
-LUGO = Path("/Users/agallojr/proj/src/q8020/q8020-cfd-experiments/results/"
-            "fvm_euler_1d_solver/2026-02-26-LuGo/circuits/"
-            "circuit_generated_nelem5_iter0.qpy")
+LUGO = (EXP / "results/fvm_euler_1d_solver/2026-02-26-LuGo/circuits/"
+        "circuit_generated_nelem5_iter0.qpy")
 LOG_ESP_PER_CZ = -11.312099 / 6549
 OUT = Path.home() / "q8020/aqc_tradeoff.csv"
 

@@ -12,9 +12,9 @@ from qiskit import qpy
 from qiskit.transpiler import generate_preset_pass_manager
 from qiskit_ibm_runtime.fake_provider import FakeMarrakesh, FakeNighthawk
 
-P = ("/Users/agallojr/proj/src/q8020/q8020-cfd-experiments/results/"
-     "fvm_euler_1d_solver/nov2025-rerun/nov_pkgs/2026-11-03/_9f0fbf67/"
-     "719a35aa/circuit_generated_statevector_nelem5_iter0.qpy")
+EXP = Path(__file__).resolve().parents[3]  # q8020-cfd-experiments
+P = (EXP / "results/fvm_euler_1d_solver/nov2025-rerun/nov_pkgs/2026-11-03/"
+     "_9f0fbf67/719a35aa/circuit_generated_statevector_nelem5_iter0.qpy")
 OUT = Path.home() / "q8020/hhl_raw_depth.csv"
 with open(P, "rb") as fh:
     c = qpy.load(fh)[0].remove_final_measurements(inplace=False)
