@@ -62,6 +62,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lugo-qpy-rewrite-2026-11"))
 from qpy_rewrite import RewriteReport, _rewrite_recip  # noqa: E402
 
+sys.path.insert(0, str(HERE))
+import real_structure as rs  # noqa: E402
+import realfit as rf  # noqa: E402
+
 TOL = 1e-9
 BASIS = ["cx", "rz", "sx", "x"]
 Synth = Callable[[np.ndarray], QuantumCircuit]
@@ -278,21 +282,79 @@ def block_circuit(lc: QuantumCircuit, theta: np.ndarray, m: int,
     return qc
 
 
+@dataclass
+class RealL:
+    """Real-L synthesis: L = diag(P, Q) fitted with real gates (Ry + CX) on
+    genode's block-diagonal 5-qubit template (realfit.bd5). At the default
+    122 CX the fit is exact (1 - F ~ 1e-13); fewer CX is approximate (AQC).
+    The fit is accepted at the first seed with 1 - F <= tol against
+    diag(P, Q) itself, else the best seed: never by the HHL solution."""
+    cx: int = 122
+    every: int = 24
+    lower: str = "line"
+    msb_targets: tuple = (0,)
+    seeds: tuple = (1, 2, 3)
+    tol: float = 1e-12
+    maxiter: int = 20000
+    info: dict = field(default_factory=dict)
+
+
+def real_l_circuit(u: np.ndarray, nb: int, cfg: RealL
+                   ) -> tuple[QuantumCircuit, np.ndarray, np.ndarray, float]:
+    """L circuit, L (= diag(P, Q)), Rx angles and max entry error. U must be
+    real up to column phases in its CSD factors (A real): real_structure
+    raises otherwise, so the assumption is checked, not taken on trust."""
+    p, q, theta, err_s = rs.real_structure(u, nb)
+    lp = sla.block_diag(p, q)
+    gates = rf.bd5(cfg.cx, every=cfg.every, lower=cfg.lower,
+                   msb_targets=list(cfg.msb_targets))
+    best = None
+    for seed in cfg.seeds:
+        t0 = time.time()
+        inf, x, nit = rf.fit(gates, nb, lp, seed, cfg.maxiter)
+        cfg.info.setdefault("tries", []).append(
+            {"seed": seed, "infidelity": inf, "iterations": nit,
+             "seconds": round(time.time() - t0, 1)})
+        if best is None or inf < best[0]:
+            best = (inf, x, seed)
+        if inf <= cfg.tol:
+            break
+    inf, x, seed = best
+    lc = rf.RealCircuit(nb, gates).to_qiskit(x)
+    lc = transpile(lc, basis_gates=BASIS, optimization_level=2,
+                   seed_transpiler=1)
+    got = Operator(lc).data
+    k = np.unravel_index(np.argmax(np.abs(lp)), lp.shape)
+    lc.global_phase += np.angle(lp[k] / got[k])
+    err = float(np.max(np.abs(Operator(lc).data - lp)))
+    cfg.info.update({"cx": cfg.cx, "every": cfg.every, "lower": cfg.lower,
+                     "msb_targets": list(cfg.msb_targets), "seed": seed,
+                     "infidelity": inf, "real_structure_err": err_s})
+    return lc, lp, theta, err
+
+
 def build(circ: QuantumCircuit, items: list, nb: int, mats: list,
           synth: Synth = qsd_synth, check: bool = True,
-          barriers: bool = False) -> tuple[QuantumCircuit, Report]:
+          barriers: bool = False, real_l: RealL | None = None
+          ) -> tuple[QuantumCircuit, Report]:
     """Rewritten circuit (no measurements) and a report. mats are the stored
     block unitaries (block_unitaries); the first must be controlled-U^1.
     With barriers, a barrier follows every block, so the transpiler cannot
     cancel one block's L against the next block's L^dag (without them,
-    qiskit level 2 removes about 150 CX at the seams at nelem 5)."""
+    qiskit level 2 removes about 150 CX at the seams at nelem 5).
+    With real_l, L is the real block-diagonal fit (RealL) instead of the
+    complex demultiplex; synth is then unused."""
     t0 = time.time()
     rep = Report(nb=nb)
     first = mats[0]
     if not np.allclose(first[0::2, 0::2], np.eye(2 ** nb), atol=TOL):
         raise ValueError("first block is not controlled on bit 0")
-    lp, theta, rep.t_offpair = structure(first[1::2, 1::2], nb)
-    lc, rep.l_err = demux_circuit(lp, nb, synth)
+    if real_l is None:
+        lp, theta, rep.t_offpair = structure(first[1::2, 1::2], nb)
+        lc, rep.l_err = demux_circuit(lp, nb, synth)
+    else:
+        lc, lp, theta, rep.l_err = real_l_circuit(first[1::2, 1::2], nb,
+                                                  real_l)
     rep.cx_l = lc.count_ops().get("cx", 0)
     nl = sum(1 for k, _, _ in items if k == "block") // 2
     out = QuantumCircuit(*circ.qregs)

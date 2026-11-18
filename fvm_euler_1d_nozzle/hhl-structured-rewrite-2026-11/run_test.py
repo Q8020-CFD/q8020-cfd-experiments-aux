@@ -113,6 +113,12 @@ def main() -> None:
     ap.add_argument("--barriers", action="store_true",
                     help="barrier after every block: no cross-block "
                     "cancellation by the transpiler")
+    ap.add_argument("--real-l", action="store_true",
+                    help="synthesize L as the real block-diagonal fit "
+                    "(exact at 122 CX) instead of the complex demultiplex")
+    ap.add_argument("--aqc-l-cx", type=int,
+                    help="with --real-l: the AQC variant fits L at this many "
+                    "CX (below 122 it is approximate)")
     a = ap.parse_args()
     out = a.out / f"nelem{a.nelem}"
     out.mkdir(parents=True, exist_ok=True)
@@ -140,7 +146,8 @@ def main() -> None:
         "experiments_repo": git_head(EXP), "input": str(src),
         "input_kind": a.input, "input_sha256": sha256(src),
         "nelem": a.nelem, "recorded_step0": read_recorded(rec),
-        "barriers": a.barriers,
+        "barriers": a.barriers, "real_l": a.real_l,
+        "aqc_l_cx": a.aqc_l_cx,
         "recorded_csv": str(rec),
     }
     log(f"load {src.name}")
@@ -166,10 +173,18 @@ def main() -> None:
     summary["cond_H"] = float(np.linalg.cond(ht))
 
     variants = {}
-    new, rep = sr.build(circ, items, nb, mats, barriers=a.barriers)
-    log(f"exact: {rep}")
-    variants["exact"] = (new, rep, None)
-    if not a.no_aqc:
+    rl = sr.RealL() if a.real_l else None
+    new, rep = sr.build(circ, items, nb, mats, barriers=a.barriers,
+                        real_l=rl)
+    log(f"exact: {rep}" + (f" real L {rl.info}" if rl else ""))
+    variants["exact"] = (new, rep, rl.info if rl else None)
+    if a.real_l and a.aqc_l_cx:
+        rq = sr.RealL(cx=a.aqc_l_cx)
+        new, rep = sr.build(circ, items, nb, mats, barriers=a.barriers,
+                            real_l=rq)
+        log(f"aqc: {rep} real L {rq.info}")
+        variants["aqc"] = (new, rep, rq.info)
+    elif not a.no_aqc and not a.real_l:
         info = []
         synth = sr.aqc_factory([int(x) for x in a.aqc_cx.split(",")],
                                [1, 2, 3], a.aqc_tol, log, info)

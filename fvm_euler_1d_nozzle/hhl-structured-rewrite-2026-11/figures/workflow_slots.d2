@@ -1,0 +1,48 @@
+# Figure (b): refinement slots between the algorithm and a result on real QC.
+# Plain-text labels only (lore-20260908-0001: no markdown, no ^, no bold).
+grid-rows: 2
+vertical-gap: 60
+
+classes: {
+  given: {style: {stroke: "#546e7a"; stroke-width: 2; fill: "#eceff1"; font-size: 16}}
+  exact: {style: {stroke: "#2e7d32"; stroke-width: 2; fill: "#e8f5e9"; font-size: 16}}
+  approx: {style: {stroke: "#ef6c00"; stroke-width: 2; fill: "#fff3e0"; font-size: 16}}
+  device: {style: {stroke: "#6a1b9a"; stroke-width: 2; fill: "#f3e5f5"; font-size: 16}}
+  run: {style: {stroke: "#1565c0"; stroke-width: 2; fill: "#e3f2fd"; font-size: 16}}
+  post: {style: {stroke: "#00838f"; stroke-width: 2; fill: "#e0f7fa"; font-size: 16}}
+  group: {style: {stroke: "#9e9e9e"; stroke-dash: 4; fill: "#fafafa"; font-size: 18}}
+}
+
+compile: "Compile (classical)" {
+  class: group
+  grid-columns: 5
+  horizontal-gap: 40
+  hhl: "HHL circuit\ndense U = exp(iHt)\n2ᵏ repeats per clock qubit\ndepth 4,424,714" {class: given}
+  lugo: "LuGo\none QSD block per power\ndepth 143,699" {class: given}
+  rewrite: "Rewrite (exact)\ncontrol only the middle\nreal L, 122 CX\ndepth 15,455" {class: exact}
+  aqc: "AQC (approximate)\nrefit L with k < 122 CX\ndepth 13,797 to 8,579\nfidelity 0.994 to 0.815" {class: approx}
+  transpile: "Transpile to device\nlayout by estimated\nsuccess, routing,\nnative gates" {class: device}
+  hhl -> lugo -> rewrite -> aqc -> transpile
+}
+
+run: "" {
+  style: {stroke-width: 0; fill: transparent}
+  grid-columns: 2
+  horizontal-gap: 50
+  execute: "Execute (QPU)" {
+    class: group
+    suppress: "Error suppression\ndynamical decoupling (XY4)\nPauli twirling of gates\nand measurements" {class: run}
+  }
+  post: "Post-process (classical)" {
+    class: group
+    grid-columns: 3
+    horizontal-gap: 40
+    mitigate: "Error mitigation\nreadout correction from\ncalibration circuits\nnoise-floor subtraction" {class: post}
+    validate: "Validation\nnull test against\npure noise\ncontrol circuit" {class: post}
+    result: "solution x" {style: {stroke: "#424242"; stroke-width: 2; fill: "#ffffff"; font-size: 17}}
+    mitigate -> validate -> result
+  }
+  execute.suppress -> post.mitigate
+}
+
+compile.transpile -> run.execute.suppress
